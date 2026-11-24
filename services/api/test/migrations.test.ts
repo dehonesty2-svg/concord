@@ -49,9 +49,24 @@ describe("databases written by earlier builds", () => {
     });
   });
 
-  it("opens the v4 workspace database and reads the tolerance column", () => {
+  it("opens the v2 workspace database with default matching windows and keeps v4 custom windows", () => {
+    upgraded("org-v2.db", ORG_MIGRATIONS, (db) => {
+      const row = db.get<{ instruction_window_hours: number; movement_window_hours: number }>(
+        "SELECT instruction_window_hours, movement_window_hours FROM assets WHERE id = 'usd-mainnet'",
+      );
+      expect(row).toEqual({ instruction_window_hours: 72, movement_window_hours: 24 });
+    });
     upgraded("org-v4.db", ORG_MIGRATIONS, (db) => {
-      expect(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'fixture'")?.value).toBe("org-v4");
+      const row = db.get<{ instruction_window_hours: number; movement_window_hours: number }>(
+        "SELECT instruction_window_hours, movement_window_hours FROM assets WHERE id = 'usd-mainnet'",
+      );
+      expect(row).toEqual({ instruction_window_hours: 48, movement_window_hours: 12 });
+    });
+  });
+
+  it("opens the v5 workspace database and reads the tolerance column", () => {
+    upgraded("org-v5.db", ORG_MIGRATIONS, (db) => {
+      expect(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'fixture'")?.value).toBe("org-v5");
       expect(db.get<{ tolerance: string }>("SELECT tolerance FROM assets WHERE id = 'usd-mainnet'")?.tolerance).toBe("5");
     });
   });

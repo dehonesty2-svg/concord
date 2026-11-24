@@ -65,8 +65,15 @@ build(join(outDir, "org-v3.db"), ORG_MIGRATIONS.slice(0, 3), (db) => {
   db.exec("INSERT INTO meta (key, value) VALUES ('fixture', 'org-v3')");
 });
 
+// Freeze the v4 schema for future upgrade-compatibility checks.
 build(join(outDir, "org-v4.db"), ORG_MIGRATIONS.slice(0, 4), (db) => {
   db.exec("INSERT INTO meta (key, value) VALUES ('fixture', 'org-v4')");
+  db.exec(`INSERT INTO assets (id, network, code, issuer, name, decimals, start_mode, state, instruction_window_hours, movement_window_hours, created_at)
+    VALUES ('usd-mainnet', 'mainnet', 'USD', 'GISSUER1', 'US Dollar', 7, 'baseline', 'ready', 48, 12, '2024-01-01T00:00:00Z')`);
+});
+
+build(join(outDir, "org-v5.db"), ORG_MIGRATIONS.slice(0, 5), (db) => {
+  db.exec("INSERT INTO meta (key, value) VALUES ('fixture', 'org-v5')");
   db.exec(`INSERT INTO assets (id, network, code, issuer, name, decimals, start_mode, state, tolerance, created_at)
     VALUES ('usd-mainnet', 'mainnet', 'USD', 'GISSUER1', 'US Dollar', 7, 'baseline', 'ready', '5', '2024-01-01T00:00:00Z')`);
 });

@@ -19,6 +19,7 @@ import {
   redemptionDeltas,
   replay,
   sortEvents,
+  splitCashInLieu,
   splitDeltas,
   templateCsv,
   TEMPLATES,
@@ -763,6 +764,129 @@ describe("corporate actions", () => {
       const kept = units + (deltas.get(address) ?? 0n);
       expect(kept * 10n + (fractions.get(address) ?? 0n)).toBe(units * 1n);
     }
+  });
+
+  it("reconciles fractions paid in cash for splits with cash in lieu", () => {
+    const snap = replay([
+      ev("mint", 1, { to: "H1", amount: 5n }),
+      ev("mint", 1, { to: "H2", amount: 7n }),
+    ]);
+
+    // 1:10 reverse split with cash in lieu at price $10/unit
+    const { deltas, fractions, cash } = splitDeltas(
+      snap,
+      { num: 1n, den: 10n },
+      [],
+      { pricePerUnit: "10", baseDecimals: 7, payDecimals: 7 },
+    );
+
+    // Floor expected units
+    expect(deltas.get("H1")).toBe(-5n);
+    expect(deltas.get("H2")).toBe(-7n);
+
+    // Expected cash: fractional part x price
+    // H1 remainder 5/10 * 10 = 5
+    // H2 remainder 7/10 * 10 = 7
+    expect(fractions.get("H1")).toBe(5n);
+    expect(fractions.get("H2")).toBe(7n);
+    expect(cash?.get("H1")).toBe(5n);
+    expect(cash?.get("H2")).toBe(7n);
+
+    // Flow 1 (units): clawbacks of floored units reconcile clean
+    const observedUnits = observeFlows(
+      [
+        ev("clawback", 10, { from: "H1", amount: 5n }),
+        ev("clawback", 10, { from: "H2", amount: 7n }),
+      ],
+      { fromLedger: 5, plus: [], minus: ["clawback"] },
+    );
+    const unitRecon = reconcileDistribution(snap, deltas, observedUnits);
+    expect(unitRecon.breaks).toHaveLength(0);
+
+    // Flow 2 (cash): payments of cash in lieu reconcile clean as a second flow
+    const observedCash = observeFlows(
+      [
+        ev("transfer", 12, { from: "PAYER", to: "H1", amount: 5n }),
+        ev("transfer", 12, { from: "PAYER", to: "H2", amount: 7n }),
+      ],
+      { fromLedger: 5, plus: ["transfer"], minus: [], payer: "PAYER" },
+    );
+    const cashRecon = reconcileDistribution(snap, cash!, observedCash);
+    expect(cashRecon.breaks).toHaveLength(0);
+    expect(cashRecon.summary.expectedTotal).toBe(12n);
+    expect(cashRecon.summary.observedTotal).toBe(12n);
+
+    // When cash in lieu is unpaid for H2, it flags a break
+    const shortCash = observeFlows(
+      [ev("transfer", 12, { from: "PAYER", to: "H1", amount: 5n })],
+      { fromLedger: 5, plus: ["transfer"], minus: [], payer: "PAYER" },
+    );
+    const shortRecon = reconcileDistribution(snap, cash!, shortCash);
+    expect(shortRecon.breaks.map((b) => `${b.type}:${b.address}`)).toEqual(["MISSING:H2"]);
+  });
+
+  it("omitting cashInLieu keeps current behaviour with no cash flow", () => {
+    const snap = replay([
+      ev("mint", 1, { to: "H1", amount: 5n }),
+      ev("mint", 1, { to: "H2", amount: 7n }),
+    ]);
+    const result = splitDeltas(snap, { num: 1n, den: 10n });
+    expect(result.cash).toBeUndefined();
+    expect(result.deltas.get("H1")).toBe(-5n);
+    expect(result.deltas.get("H2")).toBe(-7n);
+    expect(result.fractions.get("H1")).toBe(5n);
+    expect(result.fractions.get("H2")).toBe(7n);
+  });
+
+  it("computes splitCashInLieu across different decimals and rounding rules", () => {
+    const fractions = new Map<string, bigint>([
+      ["A", 1n], // 1 remainder with den 2 (half unit)
+      ["B", 2n], // 2 remainder with den 3
+    ]);
+
+    // Whole share token (baseDecimals: 0), payAsset USD (payDecimals: 2, cents)
+    // 1/2 share * $25.00/share = $12.50 = 1250 cents
+    const cashA = splitCashInLieu(new Map([["A", 1n]]), 2n, {
+      pricePerUnit: "25",
+      baseDecimals: 0,
+      payDecimals: 2,
+    });
+    expect(cashA.get("A")).toBe(1250n);
+
+    // Floor vs Half-up rounding:
+    // 2/3 * $10.00 = $6.6666...
+    // floor gives 666 cents, half-up gives 667 cents
+    const floorB = splitCashInLieu(new Map([["B", 2n]]), 3n, {
+      pricePerUnit: "10",
+      baseDecimals: 0,
+      payDecimals: 2,
+      rounding: "floor",
+    });
+    expect(floorB.get("B")).toBe(666n);
+
+    const halfUpB = splitCashInLieu(new Map([["B", 2n]]), 3n, {
+      pricePerUnit: "10",
+      baseDecimals: 0,
+      payDecimals: 2,
+      rounding: "half-up",
+    });
+    expect(halfUpB.get("B")).toBe(667n);
+
+    // Zero fraction produces no cash entitlement
+    const zeroCash = splitCashInLieu(new Map([["Z", 0n]]), 2n, {
+      pricePerUnit: "10",
+      baseDecimals: 7,
+      payDecimals: 7,
+    });
+    expect(zeroCash.size).toBe(0);
+
+    // Validation
+    expect(() =>
+      splitCashInLieu(fractions, 0n, { pricePerUnit: "1", baseDecimals: 7, payDecimals: 7 }),
+    ).toThrow("split denominator must be positive");
+    expect(() =>
+      splitCashInLieu(fractions, 2n, { pricePerUnit: "1", baseDecimals: -1, payDecimals: 7 }),
+    ).toThrow("baseDecimals must be an integer from 0 to 38, got -1");
   });
 
   it("does not count zero/zero netted-out flows in summary.holders while keeping txHashes", () => {

@@ -123,7 +123,7 @@ Stellar concepts for finance and compliance readers: [`docs/glossary-stellar.md`
 Architecture decisions: [`docs/adr/`](./docs/adr/README.md).
 
 - [`docs/overview.md`](./docs/overview.md): what it does, what it flags, why now, who buys it.
-- [`docs/limits.md`](./docs/limits.md): the deliberate limits; [`docs/ROADMAP.md`](./docs/ROADMAP.md)
+- [`docs/limits.md`](./docs/limits.md): the deliberate limits (fractions of the smallest unit in splits drop unless cash in lieu is configured); [`docs/ROADMAP.md`](./docs/ROADMAP.md)
   says which are next to fall.
 - [`docs/baselines.md`](./docs/baselines.md): opening balances (baselines), Horizon paging, per-holder cutoffs, and blind spots.
 - [`docs/prior-art.md`](./docs/prior-art.md): the prior-art check against the brief's first kill

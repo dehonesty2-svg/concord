@@ -167,7 +167,12 @@ INSERT INTO break_note_history (asset_id, scope, key, fingerprint, status, note,
   `
 CREATE INDEX actions_due ON actions (record_time) WHERE snapshot IS NULL;
 `,
-  // v4: per-asset reconciliation tolerance (smallest units as TEXT to preserve bigint precision).
+  // v4: per-asset instruction and movement matching windows (hours, bounded 1..720).
+  `
+ALTER TABLE assets ADD COLUMN instruction_window_hours INTEGER NOT NULL DEFAULT 72;
+ALTER TABLE assets ADD COLUMN movement_window_hours INTEGER NOT NULL DEFAULT 24;
+`,
+  // v5: per-asset reconciliation tolerance (smallest units as TEXT to preserve bigint precision).
   `ALTER TABLE assets ADD COLUMN tolerance TEXT;`,
 ];
 

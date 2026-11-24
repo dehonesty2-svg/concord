@@ -12,6 +12,7 @@ import {
   reconcilePositions,
   redemptionDeltas,
   replay,
+  splitCashInLieu,
   splitDeltas,
   toCsv,
   type AssetEvent,
@@ -78,6 +79,8 @@ export interface AssetRecord {
   ignore: string[];
   /** Absolute per-address difference (in smallest units) still treated as a match. */
   tolerance?: string;
+  instructionWindowHours: number;
+  movementWindowHours: number;
   createdAt: string;
 }
 
@@ -94,6 +97,8 @@ export interface WatchInput {
   baseline?: boolean;
   /** Addresses outside the register, e.g. the issuer's distribution account. */
   ignore?: string[];
+  instructionWindowHours?: number;
+  movementWindowHours?: number;
 }
 
 export type ActionType = "dividend" | "split" | "redemption";
@@ -120,6 +125,12 @@ export interface ActionInput {
   /** Split ratio or redemption fraction. */
   num?: string;
   den?: string;
+  /** Split: optional cash in lieu of fractional units. */
+  cashInLieu?: {
+    asset: string;
+    pricePerUnit: string;
+    payer?: string;
+  };
 }
 
 export interface NoteInput {
@@ -164,6 +175,15 @@ interface RunResult {
   breaks: StoredBreak[];
 }
 
+interface ActionFlowResult {
+  reconciledThrough: string | null;
+  status: "clean" | "breaks";
+  flowAsset: { id: string; code: string };
+  summary: Record<string, string | number>;
+  lines: Array<Record<string, unknown>>;
+  breaks: StoredBreak[];
+}
+
 interface ActionResult {
   reconciledThrough: string | null;
   warnings: string[];
@@ -172,11 +192,24 @@ interface ActionResult {
   summary: Record<string, string | number>;
   lines: Array<Record<string, unknown>>;
   breaks: StoredBreak[];
+  cashInLieu?: ActionFlowResult;
 }
 
 const now = () => new Date().toISOString();
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const MAX_REGISTER_CLOCK_SKEW_MS = 5 * 60_000;
+const DEFAULT_INSTRUCTION_WINDOW_HOURS = 72;
+const DEFAULT_MOVEMENT_WINDOW_HOURS = 24;
+const MIN_WINDOW_HOURS = 1;
+const MAX_WINDOW_HOURS = 720;
+
+function windowHours(value: number | undefined, field: string, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isInteger(value) || value < MIN_WINDOW_HOURS || value > MAX_WINDOW_HOURS) {
+    throw new Invalid(`${field} must be an integer between ${MIN_WINDOW_HOURS} and ${MAX_WINDOW_HOURS}`);
+  }
+  return value;
+}
 
 const HTML_ESCAPES: Record<string, string> = {
   "&": "&amp;",
@@ -294,6 +327,8 @@ function toAsset(row: Row): AssetRecord {
     state: String(row.state) as AssetRecord["state"],
     startMode: String(row.start_mode) as AssetRecord["startMode"],
     ignore: JSON.parse(String(row.ignore_addresses)) as string[],
+    instructionWindowHours: Number(row.instruction_window_hours ?? DEFAULT_INSTRUCTION_WINDOW_HOURS),
+    movementWindowHours: Number(row.movement_window_hours ?? DEFAULT_MOVEMENT_WINDOW_HOURS),
     createdAt: String(row.created_at),
   };
   if (row.issuer) asset.issuer = String(row.issuer);
@@ -376,6 +411,15 @@ export class Concord {
     return rows.map(toAsset);
   }
 
+  /**
+   * Count assets consuming the workspace watch limit (`maxAssetsPerOrg`).
+   * Assets still in initial `'indexing'` with a recorded `syncError` have never reached `'ready'`
+   * and are excluded so a failing deferred watch cannot lock up the workspace limit.
+   */
+  quotaAssetCount(): number {
+    return this.assets().filter((a) => a.state === "ready" || !a.syncError).length;
+  }
+
   networkNames(): NetworkName[] {
     return NETWORK_NAMES.filter((name) => this.networks[name]);
   }
@@ -419,6 +463,8 @@ export class Concord {
       throw new Invalid(`${resolved.code} is already watched`);
     }
     const ignore = addresses(input.ignore, "ignore");
+    const instructionWindowHours = windowHours(input.instructionWindowHours, "instructionWindowHours", DEFAULT_INSTRUCTION_WINDOW_HOURS);
+    const movementWindowHours = windowHours(input.movementWindowHours, "movementWindowHours", DEFAULT_MOVEMENT_WINDOW_HOURS);
     let name = label(input.name, "name");
     let decimals = input.decimals;
     if (input.fromLedger !== undefined && (!Number.isInteger(input.fromLedger) || input.fromLedger < 1)) {
@@ -462,8 +508,8 @@ export class Concord {
     }
     try {
       this.db.insert(
-        `INSERT INTO assets (id, network, code, issuer, name, decimals, start_mode, state, start_ledger, ignore_addresses, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'indexing', ?, ?, ?, ?)`,
+        `INSERT INTO assets (id, network, code, issuer, name, decimals, start_mode, state, start_ledger, ignore_addresses, instruction_window_hours, movement_window_hours, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'indexing', ?, ?, ?, ?, ?, ?)`,
         resolved.id,
         input.network,
         resolved.code,
@@ -473,6 +519,8 @@ export class Concord {
         startMode,
         input.fromLedger ?? null,
         JSON.stringify(ignore),
+        instructionWindowHours,
+        movementWindowHours,
         options.actor?.label ?? null,
         now(),
       );
@@ -544,7 +592,10 @@ export class Concord {
     return this.asset(asset.id);
   }
 
-  updateAsset(ref: string, patch: { name?: string; ignore?: string[]; tolerance?: string | null }): AssetRecord {
+  updateAsset(
+    ref: string,
+    patch: { name?: string; ignore?: string[]; tolerance?: string | null; instructionWindowHours?: number; movementWindowHours?: number },
+  ): AssetRecord {
     const asset = this.asset(ref);
     const name = label(patch.name, "name");
     let tolerance: string | null = asset.tolerance ?? null;
@@ -558,11 +609,19 @@ export class Concord {
         tolerance = patch.tolerance;
       }
     }
+    const instructionWindowHours = windowHours(
+      patch.instructionWindowHours,
+      "instructionWindowHours",
+      asset.instructionWindowHours,
+    );
+    const movementWindowHours = windowHours(patch.movementWindowHours, "movementWindowHours", asset.movementWindowHours);
     this.db.write(
-      "UPDATE assets SET name = ?, ignore_addresses = ?, tolerance = ? WHERE id = ?",
+      "UPDATE assets SET name = ?, ignore_addresses = ?, tolerance = ?, instruction_window_hours = ?, movement_window_hours = ? WHERE id = ?",
       name ?? asset.name,
       JSON.stringify(patch.ignore === undefined ? asset.ignore : addresses(patch.ignore, "ignore")),
       tolerance,
+      instructionWindowHours,
+      movementWindowHours,
       asset.id,
     );
     return this.asset(asset.id);
@@ -961,6 +1020,85 @@ export class Concord {
     return { runs };
   }
 
+  /**
+   * What the transfer agent changed between two registers of one asset, independently of the
+   * chain: holders added and removed, and holders whose units, accounts or statuses differ.
+   * Keyed by `holder_id`; a holder listed on several lines is compared on the sum of its units
+   * and the set of its accounts and statuses. Every list is sorted by holder id.
+   */
+  diffRegisters(ref: string, fromId: number, toId: number) {
+    const asset = this.asset(ref);
+    const load = (registerId: number) => {
+      const reg = this.db.get("SELECT id, asset_id, as_of FROM registers WHERE id = ?", registerId);
+      if (!reg) throw new NotFound(`no register ${registerId}`);
+      if (String(reg.asset_id) !== asset.id) throw new Invalid(`register ${registerId} belongs to a different asset`);
+      const holders = new Map<string, { name?: string; units: bigint; accounts: Set<string>; statuses: Set<string> }>();
+      for (const p of this.registerPositions(registerId)) {
+        const h = holders.get(p.holderId) ?? { units: 0n, accounts: new Set<string>(), statuses: new Set<string>() };
+        h.units += p.units;
+        if (p.holderName && h.name === undefined) h.name = p.holderName;
+        if (p.account) h.accounts.add(p.account);
+        if (p.status) h.statuses.add(p.status);
+        holders.set(p.holderId, h);
+      }
+      return { ref: { registerId, asOf: String(reg.as_of) }, holders };
+    };
+    const from = load(fromId);
+    const to = load(toId);
+    const sorted = (s: Set<string>) => [...s].sort();
+    const view = (h: { units: bigint; accounts: Set<string>; statuses: Set<string> }) => ({
+      units: formatUnits(h.units, asset.decimals),
+      accounts: sorted(h.accounts),
+      statuses: sorted(h.statuses),
+    });
+    const same = (a: Set<string>, b: Set<string>) => a.size === b.size && [...a].every((x) => b.has(x));
+    const byId = (a: { holderId: string }, b: { holderId: string }) =>
+      a.holderId < b.holderId ? -1 : a.holderId > b.holderId ? 1 : 0;
+
+    const added = [];
+    const removed = [];
+    const changed = [];
+    let unchanged = 0;
+    for (const [holderId, h] of to.holders) {
+      if (!from.holders.has(holderId)) added.push({ holderId, holderName: h.name ?? null, ...view(h) });
+    }
+    for (const [holderId, before] of from.holders) {
+      const after = to.holders.get(holderId);
+      if (!after) {
+        removed.push({ holderId, holderName: before.name ?? null, ...view(before) });
+        continue;
+      }
+      const fields: Array<"units" | "accounts" | "statuses"> = [];
+      if (before.units !== after.units) fields.push("units");
+      if (!same(before.accounts, after.accounts)) fields.push("accounts");
+      if (!same(before.statuses, after.statuses)) fields.push("statuses");
+      if (fields.length === 0) {
+        unchanged++;
+        continue;
+      }
+      changed.push({
+        holderId,
+        holderName: after.name ?? before.name ?? null,
+        fields,
+        unitsDelta: formatUnits(after.units - before.units, asset.decimals),
+        from: view(before),
+        to: view(after),
+      });
+    }
+    added.sort(byId);
+    removed.sort(byId);
+    changed.sort(byId);
+    return {
+      asset: { id: asset.id, code: asset.code },
+      from: from.ref,
+      to: to.ref,
+      summary: { added: added.length, removed: removed.length, changed: changed.length, unchanged },
+      added,
+      removed,
+      changed,
+    };
+  }
+
   private registerPositions(registerId: number): RegisterPosition[] {
     return this.db.all("SELECT * FROM register_positions WHERE register_id = ?", registerId).map((r) => {
       const p: RegisterPosition = { holderId: String(r.holder_id), units: BigInt(String(r.units)) };
@@ -1081,7 +1219,53 @@ export class Concord {
     });
   }
 
-  importInstructions(ref: string, csv: string) {
+  /** Imported journal entries with formatted units and latest-run movement match status. */
+  journalEntries(ref: string, options: { limit?: number; before?: string } = {}) {
+    const asset = this.asset(ref);
+    const where = ["asset_id = ?"];
+    const params: Array<string | number> = [asset.id];
+    if (options.before) {
+      const anchor = this.db.get<{ date: string }>(
+        "SELECT date FROM journal WHERE asset_id = ? AND ref = ?",
+        asset.id,
+        options.before,
+      );
+      if (anchor) {
+        where.push("(date < ? OR (date = ? AND ref < ?))");
+        params.push(anchor.date, anchor.date, options.before);
+      } else {
+        where.push("date < ?");
+        params.push(options.before);
+      }
+    }
+    const rawLimit = Number.isFinite(options.limit) ? Math.trunc(options.limit!) : 100;
+    params.push(Math.min(Math.max(rawLimit, 1), 1000));
+    const latest = this.latestRun(asset.id);
+    const movementMatches = (latest?.movement?.matches as Array<{ ref: string }> | undefined) ?? null;
+    const matchedRefs = movementMatches ? new Set(movementMatches.map((m) => m.ref)) : null;
+
+    return this.db
+      .all(`SELECT * FROM journal WHERE ${where.join(" AND ")} ORDER BY date DESC, ref DESC LIMIT ?`, ...params)
+      .map((r) => {
+        const entryRef = String(r.ref);
+        return {
+          ref: entryRef,
+          date: String(r.date),
+          type: String(r.type) as JournalEntry["type"],
+          from: r.from_addr ? String(r.from_addr) : null,
+          to: r.to_addr ? String(r.to_addr) : null,
+          units: formatUnits(BigInt(String(r.units)), asset.decimals),
+          txHash: r.tx_hash ? String(r.tx_hash) : null,
+          status: matchedRefs === null ? null : matchedRefs.has(entryRef) ? ("matched" as const) : ("unmatched" as const),
+        };
+      });
+  }
+
+  importInstructions(ref: string, csv: string, options: { mode?: "merge" | "replace" } = {}) {
+    const mode = options.mode ?? "merge";
+    if (mode !== "merge" && mode !== "replace") {
+      throw new Invalid('mode must be "merge" or "replace"');
+    }
     const asset = this.asset(ref);
     let parsed;
     try {
@@ -1089,8 +1273,24 @@ export class Concord {
     } catch (err) {
       throw new Invalid((err as Error).message);
     }
+    if (mode === "replace" && parsed.issues.length > 0) {
+      throw new Invalid(
+        `replace mode refused because the CSV had ${parsed.issues.length} parse issue(s) (line ${parsed.issues[0]!.line}: ${parsed.issues[0]!.message})`,
+      );
+    }
+    let added = 0;
+    let replaced = 0;
+    let removed = 0;
     this.db.tx(() => {
+      const existingRefs = new Set(
+        this.db.all<{ ref: string }>("SELECT ref FROM instructions WHERE asset_id = ?", asset.id).map((r) => r.ref),
+      );
+      const incomingRefs = new Set<string>();
       for (const i of parsed.instructions) {
+        if (existingRefs.has(i.ref)) replaced++;
+        else added++;
+        existingRefs.add(i.ref);
+        incomingRefs.add(i.ref);
         this.db.insert(
           `INSERT OR REPLACE INTO instructions (asset_id, ref, type, account, units, issued_at, approved_by, reason)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1104,8 +1304,15 @@ export class Concord {
           i.reason ?? null,
         );
       }
+      if (mode === "replace") {
+        for (const existingRef of existingRefs) {
+          if (!incomingRefs.has(existingRef)) {
+            removed += this.db.write("DELETE FROM instructions WHERE asset_id = ? AND ref = ?", asset.id, existingRef);
+          }
+        }
+      }
     });
-    return { instructions: parsed.instructions.length, issues: parsed.issues };
+    return { instructions: parsed.instructions.length, added, replaced, removed, issues: parsed.issues };
   }
 
   private instructions(assetId: string): Instruction[] {
@@ -1121,6 +1328,22 @@ export class Concord {
       if (r.reason) i.reason = String(r.reason);
       return i;
     });
+  }
+
+  /** Imported control instructions with formatted units. */
+  instructionList(ref: string) {
+    const asset = this.asset(ref);
+    return this.db
+      .all("SELECT * FROM instructions WHERE asset_id = ? ORDER BY issued_at DESC, ref DESC", asset.id)
+      .map((r) => ({
+        ref: String(r.ref),
+        type: String(r.type) as Instruction["type"],
+        account: String(r.account),
+        units: r.units ? formatUnits(BigInt(String(r.units)), asset.decimals) : null,
+        issuedAt: String(r.issued_at),
+        approvedBy: r.approved_by ? String(r.approved_by) : null,
+        reason: r.reason ? String(r.reason) : null,
+      }));
   }
 
   // ── reconciliation ────────────────────────────────────────────────────────
@@ -1188,6 +1411,7 @@ export class Concord {
       });
       const result = reconcileMovements(scoped, scopedJournal, {
         to: asOf,
+        windowMs: asset.movementWindowHours * 3600_000,
         ...(previous ? { from: new Date(Date.parse(previous.as_of) + 1).toISOString() } : {}),
       });
       movement = { from: previous?.as_of ?? null, to: asOf, ...result.summary, matches: result.matches };
@@ -1469,6 +1693,50 @@ ul { margin: 6px 0 0; padding-left: 20px; }
       });
   }
 
+  /**
+   * What changed between two reconciliations of one asset, yesterday's against today's say.
+   * Breaks are matched by `key`: `new` ones appear only in the later run, `resolved` ones only
+   * in the earlier, and of those in both, `changed` ones have a different `fingerprint` (the
+   * figures moved) while `persisting` ones do not. Every list is sorted by key.
+   */
+  diffRuns(fromId: number, toId: number) {
+    const load = (id: number) => {
+      const row = this.db.get("SELECT id, asset_id, as_of, result FROM runs WHERE id = ?", id);
+      if (!row) throw new NotFound(`reconciliation ${id} not found`);
+      const breaks = new Map<string, StoredBreak>();
+      for (const b of (JSON.parse(String(row.result)) as RunResult).breaks) breaks.set(b.key, b);
+      return { assetId: String(row.asset_id), ref: { runId: id, asOf: String(row.as_of) }, breaks };
+    };
+    const from = load(fromId);
+    const to = load(toId);
+    if (from.assetId !== to.assetId) {
+      throw new Invalid(`reconciliations ${fromId} and ${toId} are of different assets`);
+    }
+    const byKey = (a: { key: string }, b: { key: string }) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+    const added: StoredBreak[] = [];
+    const resolved: StoredBreak[] = [];
+    const persisting: StoredBreak[] = [];
+    const changed: Array<{ key: string; type: string; from: StoredBreak; to: StoredBreak }> = [];
+    for (const [key, after] of to.breaks) {
+      const before = from.breaks.get(key);
+      if (!before) added.push(after);
+      else if (before.fingerprint === after.fingerprint) persisting.push(after);
+      else changed.push({ key, type: after.type, from: before, to: after });
+    }
+    for (const [key, before] of from.breaks) if (!to.breaks.has(key)) resolved.push(before);
+    for (const list of [added, resolved, persisting, changed]) list.sort(byKey);
+    return {
+      assetId: from.assetId,
+      from: from.ref,
+      to: to.ref,
+      summary: { new: added.length, resolved: resolved.length, persisting: persisting.length, changed: changed.length },
+      new: added,
+      resolved,
+      persisting,
+      changed,
+    };
+  }
+
   /** The newest reconciliation of one register, if it has been reconciled. */
   latestRunForRegister(registerId: number) {
     const row = this.db.get<{ id: number }>("SELECT id FROM runs WHERE register_id = ? ORDER BY id DESC LIMIT 1", registerId);
@@ -1635,8 +1903,25 @@ ul { margin: 6px 0 0; padding-left: 20px; }
       }
       params.num = input.num;
       params.den = input.den;
+      if (input.type === "split" && input.cashInLieu) {
+        if (!input.cashInLieu.asset) throw new Invalid("cashInLieu needs asset");
+        const cash = this.asset(String(input.cashInLieu.asset));
+        if (cash.network !== asset.network) throw new Invalid("the cash in lieu asset must be on the same network");
+        if (!input.cashInLieu.pricePerUnit || !/^\d+(\.\d+)?$/.test(input.cashInLieu.pricePerUnit)) {
+          throw new Invalid("cashInLieu needs pricePerUnit as a decimal");
+        }
+        const cilPayer = address(input.cashInLieu.payer ?? input.payer, "payer");
+        params.cashInLieu = {
+          asset: cash.id,
+          pricePerUnit: input.cashInLieu.pricePerUnit,
+          ...(cilPayer ? { payer: cilPayer } : {}),
+        };
+      }
     } else {
       throw new Invalid("type must be dividend, split or redemption");
+    }
+    if (input.cashInLieu && input.type !== "split") {
+      throw new Invalid("cashInLieu is only valid for split actions");
     }
     const title =
       label(input.label, "label") ??
@@ -1695,7 +1980,7 @@ ul { margin: 6px 0 0; padding-left: 20px; }
   async reconcileAction(id: number, options: { sync?: boolean } = {}) {
     const row = this.db.get("SELECT * FROM actions WHERE id = ?", id);
     if (!row) throw new NotFound(`corporate action ${id} not found`);
-    const params = JSON.parse(String(row.params)) as Record<string, string | string[] | undefined>;
+    const params = JSON.parse(String(row.params)) as Record<string, unknown>;
     const type = String(row.type) as ActionType;
     const warnings: string[] = [];
     const refresh = options.sync !== false;
@@ -1706,6 +1991,15 @@ ul { margin: 6px 0 0; padding-left: 20px; }
       await this.trySync(flowAsset, warnings);
       // The sync moved the pay asset's read-through time; the record read above is stale.
       flowAsset = this.asset(flowAsset.id);
+    }
+    const cilParams =
+      type === "split" && params.cashInLieu
+        ? (params.cashInLieu as { asset: string; pricePerUnit: string; payer?: string })
+        : undefined;
+    let cashAsset = cilParams ? this.asset(cilParams.asset) : undefined;
+    if (refresh && cashAsset && cashAsset.id !== asset.id && cashAsset.id !== flowAsset.id) {
+      await this.trySync(cashAsset, warnings);
+      cashAsset = this.asset(cashAsset.id);
     }
 
     const recordTime = String(row.record_time);
@@ -1734,6 +2028,7 @@ ul { margin: 6px 0 0; padding-left: 20px; }
     let expected: ExpectedFlows;
     let plus: EventKind[];
     let minus: EventKind[] = [];
+    let splitFractions: Map<string, bigint> | undefined;
     const payer = params.payer as string | undefined;
     if (type === "dividend") {
       expected = dividendEntitlements(snapshot, {
@@ -1748,7 +2043,9 @@ ul { margin: 6px 0 0; padding-left: 20px; }
     } else {
       const ratio = { num: BigInt(String(params.num)), den: BigInt(String(params.den)) };
       if (type === "split") {
-        expected = splitDeltas(snapshot, ratio, exclude).deltas;
+        const splitRes = splitDeltas(snapshot, ratio, exclude);
+        expected = splitRes.deltas;
+        splitFractions = splitRes.fractions;
         plus = ["mint"];
         // Reverse splits can retire units via burn as well as issuer clawback.
         minus = ["burn", "clawback"];
@@ -1775,12 +2072,91 @@ ul { margin: 6px 0 0; padding-left: 20px; }
     }
     const ignore = [...exclude, ...(payer ? [payer] : [])];
     const recon = reconcileDistribution(snapshot, expected, observed, { ignore });
+
+    let cashFlowResult: ActionFlowResult | undefined;
+    if (type === "split" && cilParams && cashAsset && splitFractions) {
+      const ratio = { num: BigInt(String(params.num)), den: BigInt(String(params.den)) };
+      const cashExpected = splitCashInLieu(splitFractions, ratio.den, {
+        pricePerUnit: String(cilParams.pricePerUnit),
+        baseDecimals: asset.decimals,
+        payDecimals: cashAsset.decimals,
+        rounding: (params.rounding as Rounding | undefined) ?? "floor",
+      });
+      const cashPayer = cilParams.payer ?? payer;
+      const cashPlus: EventKind[] = cashPayer && cashPayer !== cashAsset.issuer ? ["transfer"] : ["mint"];
+      const cashObserved = observeFlows(this.loadEvents(cashAsset.id), {
+        afterTime: recordTime,
+        plus: cashPlus,
+        minus: [],
+        ...(windowTo ? { untilTime: windowTo } : {}),
+        ...(windowFromLedger !== undefined ? { fromLedger: windowFromLedger } : {}),
+        ...(windowToLedger !== undefined ? { toLedger: windowToLedger } : {}),
+        ...(cashPayer ? { payer: cashPayer } : {}),
+      });
+      if (cashPayer && cashObserved.size === 0) {
+        warnings.push(`Payer ${cashPayer} has no recorded flows in the action window for cash in lieu`);
+      }
+      const cashIgnore = [...exclude, ...(cashPayer ? [cashPayer] : [])];
+      const cashRecon = reconcileDistribution(snapshot, cashExpected, cashObserved, { ignore: cashIgnore });
+      const cflow = (v: bigint) => formatUnits(v, cashAsset.decimals);
+      cashFlowResult = {
+        reconciledThrough: cashAsset.syncedAt ?? null,
+        status: cashRecon.breaks.length === 0 ? "clean" : "breaks",
+        flowAsset: { id: cashAsset.id, code: cashAsset.code },
+        summary: {
+          holders: cashRecon.summary.holders,
+          expectedTotal: cflow(cashRecon.summary.expectedTotal),
+          observedTotal: cflow(cashRecon.summary.observedTotal),
+          difference: cflow(cashRecon.summary.difference),
+          breakCount: cashRecon.summary.breakCount,
+        },
+        lines: cashRecon.lines.map((l) => ({
+          address: l.address,
+          basis: base(l.basis),
+          expected: cflow(l.expected),
+          observed: cflow(l.observed),
+          difference: cflow(l.difference),
+          txHashes: l.txHashes,
+          status: l.status,
+        })),
+        breaks: cashRecon.breaks.map((b): StoredBreak => ({
+          scope: "distribution",
+          type: b.type,
+          severity: b.severity,
+          key: `cash:${b.key}`,
+          fingerprint: `${b.expected}|${b.observed}`,
+          message: `${b.message} (cash in lieu)`,
+          address: b.address,
+          expected: cflow(b.expected),
+          observed: cflow(b.observed),
+          difference: cflow(b.difference),
+        })),
+      };
+    }
+
     const base = (v: bigint) => formatUnits(v, asset.decimals);
     const flow = (v: bigint) => formatUnits(v, flowAsset.decimals);
+
+    const unitBreaks = recon.breaks.map((b): StoredBreak => ({
+      scope: "distribution",
+      type: b.type,
+      severity: b.severity,
+      key: b.key,
+      fingerprint: `${b.expected}|${b.observed}`,
+      message: b.message,
+      address: b.address,
+      expected: flow(b.expected),
+      observed: flow(b.observed),
+      difference: flow(b.difference),
+    }));
+
+    const allBreaks = cashFlowResult ? [...unitBreaks, ...cashFlowResult.breaks] : unitBreaks;
+    const isClean = recon.breaks.length === 0 && (!cashFlowResult || cashFlowResult.breaks.length === 0);
+
     const result: ActionResult = {
       reconciledThrough: flowAsset.syncedAt ?? null,
       warnings,
-      status: recon.breaks.length === 0 ? "clean" : "breaks",
+      status: isClean ? "clean" : "breaks",
       flowAsset: { id: flowAsset.id, code: flowAsset.code },
       summary: {
         holders: recon.summary.holders,
@@ -1798,18 +2174,8 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         txHashes: l.txHashes,
         status: l.status,
       })),
-      breaks: recon.breaks.map((b): StoredBreak => ({
-        scope: "distribution",
-        type: b.type,
-        severity: b.severity,
-        key: b.key,
-        fingerprint: `${b.expected}|${b.observed}`,
-        message: b.message,
-        address: b.address,
-        expected: flow(b.expected),
-        observed: flow(b.observed),
-        difference: flow(b.difference),
-      })),
+      breaks: allBreaks,
+      ...(cashFlowResult ? { cashInLieu: cashFlowResult } : {}),
     };
     this.db.write("UPDATE actions SET result = ?, reconciled_at = ? WHERE id = ?", JSON.stringify(result), now(), id);
     return this.action(id);
@@ -1880,8 +2246,22 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         "SELECT synced_at FROM assets WHERE id = ?",
         result.flowAsset.id,
       );
-      if (!flow?.synced_at) continue;
-      if (result.reconciledThrough === null || flow.synced_at > result.reconciledThrough) due.push(row.id);
+      if (flow?.synced_at && (result.reconciledThrough === null || flow.synced_at > result.reconciledThrough)) {
+        due.push(row.id);
+        continue;
+      }
+      if (result.cashInLieu?.flowAsset?.id) {
+        const cashFlow = this.db.get<{ synced_at: string | null }>(
+          "SELECT synced_at FROM assets WHERE id = ?",
+          result.cashInLieu.flowAsset.id,
+        );
+        if (
+          cashFlow?.synced_at &&
+          (result.cashInLieu.reconciledThrough === null || cashFlow.synced_at > result.cashInLieu.reconciledThrough)
+        ) {
+          due.push(row.id);
+        }
+      }
     }
     let done = 0;
     for (const id of due) {
@@ -1917,6 +2297,7 @@ ul { margin: 6px 0 0; padding-left: 20px; }
       instructionList.filter((i) => !window || Date.parse(i.issuedAt) <= Date.parse(window.to)),
       {
         asOf: window?.to ?? asset.syncedAt ?? new Date().toISOString(),
+        windowMs: asset.instructionWindowHours * 3600_000,
         initialFrozen,
         ...(indexedFrom ? { indexedFrom } : {}),
       },
@@ -2065,6 +2446,8 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         indexedToLedger: asset.syncedLedger ?? null,
         indexedTo: asset.syncedAt ?? null,
         ignoredAddresses: asset.ignore,
+        instructionWindowHours: asset.instructionWindowHours,
+        movementWindowHours: asset.movementWindowHours,
       },
       period: { from, to },
       holdings: (() => {
@@ -2073,7 +2456,22 @@ ul { margin: 6px 0 0; padding-left: 20px; }
       })(),
       registers,
       reconciliations: runs,
-      corporateActions: this.actions(asset.id).filter((a) => inPeriod(a.recordTime)),
+      corporateActions: this.actions(asset.id)
+        .filter((a) => inPeriod(a.recordTime))
+        .map(({ result, ...rest }) => ({
+          ...rest,
+          result: result
+            ? {
+                reconciledThrough: result.reconciledThrough,
+                warnings: result.warnings,
+                status: result.status,
+                flowAsset: result.flowAsset,
+                summary: result.summary,
+                lines: result.lines,
+                breaks: result.breaks,
+              }
+            : null,
+        })),
       controls,
       // The whole trail, not the period: sign-offs happen in wall-clock time, not chain time.
       signoffHistory: this.noteHistory(asset.id),
@@ -2084,8 +2482,39 @@ ul { margin: 6px 0 0; padding-left: 20px; }
     return { generatedAt: now(), generator: "concord/0.1.0", sha256: sha256(JSON.stringify(content)), ...content };
   }
 
-  /** One section of the audit pack as CSV. */
-  exportCsv(ref: string, section: string, period: { from?: string; to?: string } = {}): string {
+  /** One section of the audit pack, or one corporate action's entitlement table, as CSV. */
+  exportCsv(ref: string, section: string, period: { from?: string; to?: string; id?: number } = {}): string {
+    if (section === "action") {
+      const asset = this.asset(ref);
+      if (period.id === undefined || !Number.isSafeInteger(period.id) || period.id < 1) {
+        throw new Invalid("action export needs a positive integer id");
+      }
+      const act = this.action(period.id);
+      if (act.assetId !== asset.id) {
+        throw new Invalid(`corporate action ${period.id} belongs to another asset`);
+      }
+      const lines = (act.result?.lines ?? []) as Array<{
+        address: string;
+        basis: string;
+        expected: string;
+        observed: string;
+        difference: string;
+        status: string;
+        txHashes: string[];
+      }>;
+      return toCsv(
+        ["address", "recordHolding", "expected", "observed", "difference", "status", "txHashes"],
+        lines.map((l) => ({
+          address: l.address,
+          recordHolding: l.basis,
+          expected: l.expected,
+          observed: l.observed,
+          difference: l.difference,
+          status: l.status,
+          txHashes: l.txHashes.join(";"),
+        })),
+      );
+    }
     const pack = this.auditExport(ref, period);
     switch (section) {
       case "holdings":
@@ -2136,7 +2565,7 @@ ul { margin: 6px 0 0; padding-left: 20px; }
         );
       }
       default:
-        throw new Invalid("section must be holdings, events, controls or breaks");
+        throw new Invalid("section must be holdings, events, controls, breaks or action");
     }
   }
 }

@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import { readFileSync as readFixture } from "node:fs";
 import { Asset, StrKey, nativeToScVal } from "@stellar/stellar-sdk";
 import { Auth } from "../src/auth.js";
+import { runCli } from "../src/cli.js";
 import { StellarSource } from "../src/chain.js";
 import { Concord } from "../src/concord.js";
 import { loadConfig } from "../src/config.js";
@@ -25,6 +26,7 @@ const ORG_MIGRATION_DIGESTS = [
   "1a4f90d62ead1ba8254ab3244d04be0ca9f46646df78cd12f1ece6db41bd2387",
   "2002f2e1b269939a38de8da3768a85787f98ce207246cf15134423ffdce6db72",
   "ece8f3334de957d19e76585727af4790c2f6ba78f60407ade9a67e1edb25cd55",
+  "d440cffcfb710a703cdb8c0b02c4704aeaf366b2c254ffd5e7789e25898f6174",
   "b7413e3d4eee55f419c70db885e1866b95c8c1a2b7d7f68eea4e44ecac93e611",
 ];
 const CONTROL_MIGRATION_DIGESTS = ["ba25bc5419cfcc376d2e7ff027845b2da4b789d9c7e966424b70cdfbbb90a422"];
@@ -708,6 +710,81 @@ describe("teams", () => {
     await owner.json(`/api/org/members/${me.user.id}`, { method: "DELETE" });
     expect((await cat.call("/api/overview")).status).toBe(401);
     expect((await cat.call("/api/auth/signin", { body: { email: "cat@alpha.test", password: "correct horse battery" } })).status).toBe(401);
+  });
+
+  it("lets the operator create a single-use 7-day invitation link via createInviteAs and CLI invite", async () => {
+    const h = harness();
+    const owner = await new Client(h.app).signUp("ann@alpha.test", "Alpha", "Ann");
+
+    // Default role is member and works once; expires after 7 days.
+    const memberInv = h.auth.createInviteAs(owner.orgId, "op-member@alpha.test");
+    expect(memberInv.role).toBe("member");
+    expect(h.auth.lookupInvite(memberInv.token)).toEqual({
+      org: "Alpha",
+      email: "op-member@alpha.test",
+      role: "member",
+      hasAccount: false,
+    });
+    const memberClient = new Client(h.app);
+    const joinedMember = await memberClient.json<{ org: { id: string }; role: string }>("/api/auth/invites/accept", {
+      body: { token: memberInv.token, name: "Member", password: "correct horse battery" },
+    });
+    expect(joinedMember).toMatchObject({ org: { id: owner.orgId }, role: "member" });
+    expect((await new Client(h.app).call("/api/auth/invites/accept", {
+      body: { token: memberInv.token, name: "Again", password: "correct horse battery" },
+    })).status).toBe(400);
+
+    // Expiry after 7 days.
+    const expiring = h.auth.createInviteAs(owner.orgId, "expiring@alpha.test");
+    h.now.value += 7 * 86_400_000 + 1;
+    expect(h.auth.lookupInvite(expiring.token)).toBeUndefined();
+
+    // CLI invite prints ${publicUrl}/#/invite/<token> with optional --role owner.
+    const dir = mkdtempSync(join(tmpdir(), "concord-cli-556-"));
+    try {
+      const rt = openRuntime(loadConfig({ CONCORD_DATA_DIR: dir, CONCORD_SIGNUP: "open" }));
+      let cliOrgId: string;
+      try {
+        const fastAuth = new Auth(rt.control, { signup: "open", cost: { N: 1024, r: 8, p: 1 } });
+        const signed = await fastAuth.signUp({
+          email: "seed@alpha.test",
+          name: "Seed",
+          orgName: "Operator Org",
+          password: "correct horse battery",
+        });
+        cliOrgId = signed.orgId;
+      } finally {
+        rt.close();
+      }
+
+      const lines: string[] = [];
+      const spy = vi.spyOn(console, "log").mockImplementation((msg?: unknown) => lines.push(String(msg ?? "")));
+      try {
+        await runCli(["invite", cliOrgId, "recovery-owner@alpha.test", "--role", "owner"], {
+          CONCORD_DATA_DIR: dir,
+          CONCORD_PUBLIC_URL: ORIGIN,
+        });
+      } finally {
+        spy.mockRestore();
+      }
+      const linkLine = lines.find((l) => l.startsWith(`${ORIGIN}/#/invite/`));
+      expect(linkLine).toBeTruthy();
+      const cliToken = linkLine!.split("/#/invite/")[1]!;
+
+      const verifyRt = openRuntime(loadConfig({ CONCORD_DATA_DIR: dir, CONCORD_SIGNUP: "open" }));
+      try {
+        expect(verifyRt.auth.lookupInvite(cliToken)).toEqual({
+          org: "Operator Org",
+          email: "recovery-owner@alpha.test",
+          role: "owner",
+          hasAccount: false,
+        });
+      } finally {
+        verifyRt.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
   });
 });
 
@@ -1479,6 +1556,70 @@ describe("chain endpoints", () => {
       }
     },
   );
+  it("baseline() handles an empty first page, fails over on invalid Latest-Ledger headers, and stops after 200 records with no next link", async () => {
+    const issuer = key();
+    const firstPath = `/accounts?asset=FUND%3A${issuer}&limit=200&order=asc`;
+    const h1 = "https://h1.example";
+    const h2 = "https://h2.example";
+    const multiHorizonNet = {
+      name: "mainnet" as const,
+      passphrase: MAINNET_PASSPHRASE,
+      rpc: [{ url: "https://rpc.example" }],
+      horizon: [{ url: h1 }, { url: h2 }],
+    };
+    const record = (id: string, balance: string) => ({
+      account_id: id,
+      balances: [{ asset_code: "FUND", asset_issuer: issuer, balance, is_authorized: true }],
+    });
+
+    // 1. Empty first page returns an empty map at the page's ledger.
+    const empty = scripted({
+      [`https://horizon.example${firstPath}`]: [
+        () => new Response(JSON.stringify({ _links: {}, _embedded: { records: [] } }), { headers: { "latest-ledger": "77" } }),
+      ],
+    });
+    const emptyBaseline = await new StellarSource(network(["https://rpc.example"]), empty.deps).baseline("FUND", issuer, 7);
+    expect(emptyBaseline.ledger).toBe(77);
+    expect(emptyBaseline.openings.size).toBe(0);
+    expect(empty.calls.map((c) => c.url)).toEqual([`https://horizon.example${firstPath}`]);
+
+    // 2. Missing, '0', or 'abc' Latest-Ledger header fails over to the next Horizon endpoint.
+    for (const badHeaders of [{}, { "latest-ledger": "0" }, { "latest-ledger": "abc" }] as Array<Record<string, string>>) {
+      const failoverHolder = key();
+      const failover = scripted({
+        [`${h1}${firstPath}`]: [
+          () => new Response(JSON.stringify({ _links: {}, _embedded: { records: [] } }), { headers: badHeaders }),
+        ],
+        [`${h2}${firstPath}`]: [
+          () =>
+            new Response(
+              JSON.stringify({ _links: {}, _embedded: { records: [record(failoverHolder, "5.0000000")] } }),
+              { headers: { "latest-ledger": "88" } },
+            ),
+        ],
+      });
+      const res = await new StellarSource(multiHorizonNet, failover.deps).baseline("FUND", issuer, 7);
+      expect(res.ledger).toBe(88);
+      expect(res.openings.size).toBe(1);
+      expect(res.openings.get(failoverHolder)).toEqual({ amount: u(5), asOfLedger: 88, authorized: true });
+      expect(failover.calls.map((c) => c.url)).toEqual([`${h1}${firstPath}`, `${h2}${firstPath}`]);
+    }
+
+    // 3. Exactly 200 records with no _links.next stops after one request.
+    const twoHundred = Array.from({ length: 200 }, () => record(key(), "1.0000000"));
+    const singleFull = scripted({
+      [`https://horizon.example${firstPath}`]: [
+        () =>
+          new Response(JSON.stringify({ _links: {}, _embedded: { records: twoHundred } }), {
+            headers: { "latest-ledger": "99" },
+          }),
+      ],
+    });
+    const fullBaseline = await new StellarSource(network(["https://rpc.example"]), singleFull.deps).baseline("FUND", issuer, 7);
+    expect(fullBaseline.ledger).toBe(99);
+    expect(fullBaseline.openings.size).toBe(200);
+    expect(singleFull.calls.map((c) => c.url)).toEqual([`https://horizon.example${firstPath}`]);
+  });
 
   it("finds classic assets by code, most widely held first", async () => {
     const [i1, i2] = [key(), key()];
@@ -1641,6 +1782,41 @@ describe("chain endpoints", () => {
     const head = await source.latestLedger();
     expect(head.latest).toBe(50);
     expect(calls.map((c) => c.url)).toEqual([a, a, b]);
+  });
+
+  it("retries a timed-out request once on the same endpoint with backoff, then fails over to the next endpoint", async () => {
+    const a = "https://a.example/secret-key";
+    const b = "https://b.example";
+    const timeout = () => {
+      throw new DOMException("t", "TimeoutError");
+    };
+    const { calls, clock, deps } = scripted({
+      [a]: [timeout, timeout],
+      [b]: [health],
+    });
+    const sleeps: number[] = [];
+    const trackedDeps = {
+      ...deps,
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+        await deps.sleep(ms);
+      },
+    };
+    const before = clock.value;
+    const source = new StellarSource(network([a, b]), trackedDeps);
+    expect(await source.latestLedger()).toMatchObject({ latest: 50, oldest: 10 });
+    expect(calls.map((c) => c.url)).toEqual([a, a, b]);
+    expect(sleeps).toHaveLength(1);
+    expect(sleeps[0]!).toBeGreaterThanOrEqual(250);
+    expect(sleeps[0]!).toBeLessThanOrEqual(500);
+    expect(clock.value - before).toBeCloseTo(sleeps[0]!, 6);
+
+    const single = scripted({ [a]: [timeout, timeout] });
+    const allFail = new StellarSource(network([a]), single.deps);
+    const err = await allFail.latestLedger().catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe("Stellar RPC (mainnet) is unavailable (a.example: timed out)");
+    expect((err as Error).message).not.toContain("secret-key");
   });
 
   it("getEvents maps cursor, latestLedger, latestLedgerCloseTime, missing events, and skips ignored events", async () => {

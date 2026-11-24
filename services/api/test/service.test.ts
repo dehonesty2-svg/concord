@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import Ajv from "ajv";
 import { Keypair, StrKey, nativeToScVal } from "@stellar/stellar-sdk";
@@ -165,6 +167,104 @@ describe("decodeEvent", () => {
     expect(page.latestLedger).toBe(100);
     expect(page.cursor).toBe("cursor-1");
   });
+
+  it("never throws across 5000 seeded fuzz inputs", { timeout: 30_000 }, () => {
+    const seed = 0x512c0de;
+    let state = seed >>> 0;
+    const nextU32 = () => {
+      state = (state + 0x6d2b79f5) >>> 0;
+      let t = state;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return (t ^ (t >>> 14)) >>> 0;
+    };
+    const nextInt = (max: number) => nextU32() % max;
+    const randBase64 = (len: number) => {
+      const buf = Buffer.allocUnsafe(len);
+      for (let j = 0; j < len; j++) buf[j] = nextInt(256);
+      return buf.toString("base64");
+    };
+
+    const validTemplates = [
+      { topic: [sym("transfer"), addr(a), addr(b), str(`FUND:${a}`)], value: i128(5n) },
+      { topic: [sym("mint"), addr(a), addr(b), str(`FUND:${a}`)], value: i128(7n) },
+      { topic: [sym("burn"), addr(b), str(`FUND:${a}`)], value: i128(3n) },
+      { topic: [sym("clawback"), addr(a), addr(b), str(`FUND:${a}`)], value: i128(2n) },
+      { topic: [sym("set_authorized"), addr(b), str(`FUND:${a}`)], value: nativeToScVal(true).toXDR("base64") },
+    ];
+    const hugeVecXdr = nativeToScVal(Array.from({ length: 120 }, (_, k) => k)).toXDR("base64");
+    const extraTopics = [sym("transfer"), sym("mint"), sym("approve"), addr(a), str("extra"), hugeVecXdr];
+    const weirdDates = [
+      "",
+      "garbage",
+      "0",
+      "1970-01-01T00:00:00Z",
+      "+275760-09-13T00:00:00.000Z",
+      "-271821-04-20T00:00:00.000Z",
+      "9999-12-31T23:59:59.999Z",
+      "2026-10-01T00:00:00Z",
+      "2026-02-30T25:61:61Z",
+    ];
+    const mutateB64 = (b64: string) => {
+      const buf = Buffer.from(b64, "base64");
+      if (buf.length === 0) return randBase64(8);
+      const op = nextInt(3);
+      if (op === 0) {
+        buf[nextInt(buf.length)] ^= 1 << nextInt(8);
+        return buf.toString("base64");
+      }
+      if (op === 1) {
+        return buf.subarray(0, nextInt(buf.length)).toString("base64");
+      }
+      return b64.slice(0, Math.max(1, nextInt(b64.length)));
+    };
+
+    for (let i = 0; i < 5000; i++) {
+      const mode = i % 4;
+      let topic: string[];
+      let value: string;
+      let ledgerClosedAt = "2026-10-01T00:00:00Z";
+
+      if (mode === 0) {
+        const count = nextInt(6);
+        topic = Array.from({ length: count }, () => randBase64(nextInt(40)));
+        value = randBase64(nextInt(48));
+      } else if (mode === 1) {
+        const tmpl = validTemplates[nextInt(validTemplates.length)]!;
+        topic = [...tmpl.topic];
+        if (nextInt(2) === 0 && topic.length > 0) topic[nextInt(topic.length)] = mutateB64(topic[nextInt(topic.length)]!);
+        if (nextInt(2) === 0 && topic.length >= 2) {
+          const x = nextInt(topic.length);
+          const y = nextInt(topic.length);
+          [topic[x], topic[y]] = [topic[y]!, topic[x]!];
+        }
+        value = nextInt(2) === 0 ? mutateB64(tmpl.value) : tmpl.value;
+      } else if (mode === 2) {
+        const tmpl = validTemplates[nextInt(validTemplates.length)]!;
+        topic = [...tmpl.topic, ...Array.from({ length: 80 }, () => extraTopics[nextInt(extraTopics.length)]!)];
+        value = nextInt(2) === 0 ? hugeVecXdr : tmpl.value;
+      } else {
+        const tmpl = validTemplates[nextInt(validTemplates.length)]!;
+        topic = [...tmpl.topic];
+        value = tmpl.value;
+        ledgerClosedAt = weirdDates[nextInt(weirdDates.length)]!;
+      }
+
+      const candidate = {
+        ...raw(topic, value),
+        ledgerClosedAt,
+      };
+      let decoded: ReturnType<typeof decodeEvent>;
+      try {
+        decoded = decodeEvent(candidate);
+      } catch (err) {
+        throw new Error(`decodeEvent threw on seed=0x${seed.toString(16)} iter=${i}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (decoded !== undefined && (typeof decoded !== "object" || decoded === null || typeof decoded.kind !== "string")) {
+        throw new Error(`Unexpected decodeEvent return on seed=0x${seed.toString(16)} iter=${i}`);
+      }
+    }
+  });
 });
 
 describe("cursorLedger", () => {
@@ -293,6 +393,183 @@ describe("Concord", () => {
     expect(later).toMatchObject({ duplicate: false });
     expect(later.registerId).not.toBe(first.registerId);
     expect(concord.registers("FUND")).toHaveLength(2);
+  });
+
+  it("diffs two reconciliation runs into new, resolved, persisting and changed breaks by key", async () => {
+    await concord.sync("FUND");
+    // Chain: h1 90 (active), h2 55 (frozen). Yesterday the register has h2 short and a holder
+    // for h3, who holds nothing; today h2 is short by less, h3 is gone and h1 is marked frozen.
+    // E has no account on either day, with the same units.
+    const yesterday = concord.importRegister("FUND", {
+      csv: `holder_id,account,units,status\nA,${h1},90,active\nB,${h2},50,frozen\nC,${h3},10,active\nE,,3,\n`,
+      asOf: at(40),
+    });
+    const today = concord.importRegister("FUND", {
+      csv: `holder_id,account,units,status\nA,${h1},90,frozen\nB,${h2},52,frozen\nE,,3,\n`,
+      asOf: at(41),
+    });
+    const first = await concord.reconcile("FUND", yesterday.registerId);
+    const second = await concord.reconcile("FUND", today.registerId);
+
+    const diff = concord.diffRuns(first.id, second.id);
+    expect(diff.from).toEqual({ runId: first.id, asOf: at(40) });
+    expect(diff.to).toEqual({ runId: second.id, asOf: at(41) });
+    expect(diff.new.map((b) => b.key)).toContain(`STATUS_MISMATCH:${h1}`);
+    expect(diff.resolved.map((b) => b.key)).toContain(`MISSING_ON_CHAIN:${h3}`);
+    expect(diff.persisting.map((b) => b.key)).toContain("UNMAPPED_HOLDER:E");
+    const quantity = diff.changed.find((c) => c.key === `QUANTITY_MISMATCH:${h2}`);
+    expect(quantity).toMatchObject({
+      type: "QUANTITY_MISMATCH",
+      from: { registerUnits: "50" },
+      to: { registerUnits: "52" },
+    });
+
+    // Every break of either run lands in exactly one class, and each list is sorted by key.
+    const keys = (breaks: { key: string }[]) => breaks.map((b) => b.key);
+    const before = new Set(keys(first.breaks));
+    const after = new Set(keys(second.breaks));
+    expect(keys(diff.new).sort()).toEqual([...after].filter((k) => !before.has(k)).sort());
+    expect(keys(diff.resolved).sort()).toEqual([...before].filter((k) => !after.has(k)).sort());
+    expect([...keys(diff.persisting), ...keys(diff.changed)].sort()).toEqual(
+      [...after].filter((k) => before.has(k)).sort(),
+    );
+    for (const list of [diff.new, diff.resolved, diff.persisting, diff.changed]) {
+      expect(keys(list)).toEqual([...keys(list)].sort());
+    }
+    expect(diff.summary).toEqual({
+      new: diff.new.length,
+      resolved: diff.resolved.length,
+      persisting: diff.persisting.length,
+      changed: diff.changed.length,
+    });
+
+    // Reversed, new and resolved swap; persisting stays.
+    const back = concord.diffRuns(second.id, first.id);
+    expect(keys(back.new)).toEqual(keys(diff.resolved));
+    expect(keys(back.resolved)).toEqual(keys(diff.new));
+    expect(keys(back.persisting)).toEqual(keys(diff.persisting));
+
+    // A run against itself: everything persists.
+    expect(concord.diffRuns(second.id, second.id).summary).toEqual({
+      new: 0,
+      resolved: 0,
+      persisting: second.breaks.length,
+      changed: 0,
+    });
+  });
+
+  it("refuses to diff reconciliation runs of different assets, or one that does not exist", async () => {
+    const other = await concord.watchAsset({ network: "testnet", asset: `OTHER:${key()}`, fromLedger: 1 });
+    const csv = `holder_id,account,units\nA,${h1},90\n`;
+    const mine = await concord.reconcile("FUND", concord.importRegister("FUND", { csv, asOf: at(40) }).registerId);
+    const theirs = await concord.reconcile(
+      other.id,
+      concord.importRegister(other.id, { csv, asOf: at(40) }).registerId,
+    );
+    expect(() => concord.diffRuns(mine.id, theirs.id)).toThrow(
+      new Invalid(`reconciliations ${mine.id} and ${theirs.id} are of different assets`),
+    );
+    expect(() => concord.diffRuns(mine.id, 99_999)).toThrow(new NotFound("reconciliation 99999 not found"));
+  });
+
+  it("diffs two registers by holder id: added, removed and changed holders, each sorted", () => {
+    const yesterday = concord.importRegister("FUND", {
+      csv: [
+        "holder_id,holder_name,account,units,status",
+        `D,Dora,${h1},10,active`,
+        `A,Ann,${h1},90,active`,
+        `C,Cy,${h2},5,active`,
+        `E,Eve,${h3},7,active`,
+        // Split over two lines: compared on the sum and the set of accounts.
+        `B,Bo,${h2},30,active`,
+        `B,Bo,${h3},20,active`,
+        `F,Flo,,1,`,
+      ].join("\n"),
+      asOf: at(40),
+    });
+    const today = concord.importRegister("FUND", {
+      csv: [
+        "holder_id,holder_name,account,units,status",
+        `Z,Zed,${h3},4,active`,
+        `A,Ann,${h1},90,active`,
+        `B,Bo,${h3},20,active`,
+        `B,Bo,${h2},30,active`,
+        `C,Cy,${h2},5.5,active`,
+        `E,Eve,${h1},7,frozen`,
+        `F,Flo,${h2},1,`,
+        `G,Gus,${h3},2,active`,
+      ].join("\n"),
+      asOf: at(41),
+    });
+
+    const diff = concord.diffRegisters("FUND", yesterday.registerId, today.registerId);
+    expect(diff.from).toEqual({ registerId: yesterday.registerId, asOf: at(40) });
+    expect(diff.to).toEqual({ registerId: today.registerId, asOf: at(41) });
+    expect(diff.summary).toEqual({ added: 2, removed: 1, changed: 3, unchanged: 2 });
+    expect(diff.added).toEqual([
+      { holderId: "G", holderName: "Gus", units: "2", accounts: [h3], statuses: ["active"] },
+      { holderId: "Z", holderName: "Zed", units: "4", accounts: [h3], statuses: ["active"] },
+    ]);
+    expect(diff.removed).toEqual([
+      { holderId: "D", holderName: "Dora", units: "10", accounts: [h1], statuses: ["active"] },
+    ]);
+    expect(diff.changed).toEqual([
+      {
+        holderId: "C",
+        holderName: "Cy",
+        fields: ["units"],
+        unitsDelta: "0.5",
+        from: { units: "5", accounts: [h2], statuses: ["active"] },
+        to: { units: "5.5", accounts: [h2], statuses: ["active"] },
+      },
+      {
+        holderId: "E",
+        holderName: "Eve",
+        fields: ["accounts", "statuses"],
+        unitsDelta: "0",
+        from: { units: "7", accounts: [h3], statuses: ["active"] },
+        to: { units: "7", accounts: [h1], statuses: ["frozen"] },
+      },
+      {
+        holderId: "F",
+        holderName: "Flo",
+        fields: ["accounts"],
+        unitsDelta: "0",
+        from: { units: "1", accounts: [], statuses: [] },
+        to: { units: "1", accounts: [h2], statuses: [] },
+      },
+    ]);
+
+    // The other way round, removals and additions swap and deltas change sign.
+    const back = concord.diffRegisters("FUND", today.registerId, yesterday.registerId);
+    expect(back.summary).toEqual({ added: 1, removed: 2, changed: 3, unchanged: 2 });
+    expect(back.changed.find((c) => c.holderId === "C")?.unitsDelta).toBe("-0.5");
+    // Line order in the file does not decide the result order.
+    expect(back.removed.map((r) => r.holderId)).toEqual(["G", "Z"]);
+  });
+
+  it("finds nothing to report between a register and itself", () => {
+    const reg = concord.importRegister("FUND", {
+      csv: `holder_id,account,units\nA,${h1},90\nB,${h2},55\n`,
+      asOf: at(40),
+    });
+    expect(concord.diffRegisters("FUND", reg.registerId, reg.registerId)).toMatchObject({
+      summary: { added: 0, removed: 0, changed: 0, unchanged: 2 },
+      added: [],
+      removed: [],
+      changed: [],
+    });
+  });
+
+  it("rejects a register of another asset, and one that does not exist", async () => {
+    const other = await concord.watchAsset({ network: "testnet", asset: `OTHER:${key()}`, fromLedger: 1 });
+    const mine = concord.importRegister("FUND", { csv: `holder_id,account,units\nA,${h1},90\n`, asOf: at(40) });
+    const theirs = concord.importRegister(other.id, { csv: `holder_id,account,units\nA,${h1},90\n`, asOf: at(40) });
+    expect(() => concord.diffRegisters("FUND", mine.registerId, theirs.registerId)).toThrow(
+      new Invalid(`register ${theirs.registerId} belongs to a different asset`),
+    );
+    expect(() => concord.diffRegisters("FUND", theirs.registerId, mine.registerId)).toThrow(Invalid);
+    expect(() => concord.diffRegisters("FUND", mine.registerId, 99_999)).toThrow(new NotFound("no register 99999"));
   });
 
   it("rounds holder shares half up to four decimals so two thirds and one third add to 100", async () => {
@@ -849,7 +1126,9 @@ describe("Concord", () => {
         "asset.indexedFromLedger",
         "asset.indexedTo",
         "asset.indexedToLedger",
+        "asset.instructionWindowHours",
         "asset.issuer",
+        "asset.movementWindowHours",
         "asset.name",
         "asset.network",
         "controls.asOf",
@@ -1883,6 +2162,364 @@ describe("Concord", () => {
       },
     });
     expect(res2).toMatchObject({ entries: 2, added: 1, replaced: 1, removed: 1 });
+  });
+
+  it("exports a corporate action entitlement table as CSV and refuses unknown or cross-asset actions", async () => {
+    const h = harness();
+    const client = await new Client(h.app).signUp("csvaction@example.test", "Action CSV");
+    const issuer1 = key();
+    const issuer2 = key();
+    const h1 = key();
+    const h2 = key();
+    const payer = key();
+    const concord = h.tenants.forOrg(client.orgId);
+
+    const fund = await concord.watchAsset({ network: "testnet", asset: `FUND:${issuer1}`, fromLedger: 1 });
+    const other = await concord.watchAsset({ network: "testnet", asset: `OTHER:${issuer2}`, fromLedger: 1 });
+    h.chain.push(fund.id, "mint", 2, { to: h1, amount: u(100) });
+    h.chain.push(fund.id, "mint", 2, { to: h2, amount: u(50) });
+    h.chain.push(fund.id, "transfer", 10, { from: payer, to: h1, amount: u(10), txHash: "tx-a" });
+    h.chain.push(fund.id, "transfer", 11, { from: payer, to: h1, amount: u(5), txHash: "tx-b" });
+    await concord.sync(fund.id);
+
+    const action = await concord.createAction("FUND", {
+      type: "dividend",
+      recordTime: at(5),
+      ratePerUnit: "0.2",
+      payer,
+    });
+
+    const csv = concord.exportCsv("FUND", "action", { id: action.id });
+    const lines = csv.trim().split("\n");
+    expect(lines[0]).toBe("address,recordHolding,expected,observed,difference,status,txHashes");
+    expect(lines.slice(1)).toHaveLength(2);
+    expect(lines.slice(1)).toEqual(
+      expect.arrayContaining([
+        `${h1},100,20,15,-5,SHORT,tx-a;tx-b`,
+        `${h2},50,10,0,-10,MISSING,`,
+      ]),
+    );
+
+    const httpRes = await client.call(`/api/assets/${fund.id}/export?section=action&id=${action.id}`);
+    expect(httpRes.status).toBe(200);
+    expect(httpRes.headers.get("content-type")).toContain("text/csv");
+    expect(await httpRes.text()).toBe(csv);
+
+    expect(() => concord.exportCsv("FUND", "action", { id: 999999 })).toThrow(NotFound);
+    expect(() => concord.exportCsv(other.id, "action", { id: action.id })).toThrow(Invalid);
+    expect((await client.call(`/api/assets/${other.id}/export?section=action&id=${action.id}`)).status).toBe(400);
+  });
+
+  it("applies per-asset instructionWindowHours and movementWindowHours and includes them in the audit pack", async () => {
+    const h = harness();
+    const client = await new Client(h.app).signUp("windows@example.test", "Windows Org");
+    const issuer = key();
+    const holder = key();
+    const concord = h.tenants.forOrg(client.orgId);
+
+    await expect(
+      concord.watchAsset({ network: "testnet", asset: `BAD:${issuer}`, fromLedger: 1, instructionWindowHours: 0 }),
+    ).rejects.toThrow(/between 1 and 720/);
+    await expect(
+      concord.watchAsset({ network: "testnet", asset: `BAD:${issuer}`, fromLedger: 1, movementWindowHours: 721 }),
+    ).rejects.toThrow(/between 1 and 720/);
+
+    // Custom tight windows: 2h for instructions, 2h for movements.
+    // Recall FakeChain helper at(n) advances 60s per ledger (60 ledgers = 1h).
+    const asset = await concord.watchAsset({
+      network: "testnet",
+      asset: `FUND:${issuer}`,
+      fromLedger: 1,
+      instructionWindowHours: 2,
+      movementWindowHours: 2,
+    });
+    expect(asset.instructionWindowHours).toBe(2);
+    expect(asset.movementWindowHours).toBe(2);
+
+    // Mint executes at ledger 185 (~3h after ledger 5) and freeze executes at ledger 185 (~3h after ledger 5).
+    h.chain.latest = 200;
+    h.chain.push(asset.id, "mint", 185, { to: holder, amount: u(50), txHash: "tx-mint" });
+    h.chain.push(asset.id, "set_authorized", 185, { from: holder, authorized: false, txHash: "tx-freeze" });
+    await concord.sync(asset.id);
+
+    concord.importJournal(asset.id, `ref,date,type,from_account,to_account,units\nJ1,${at(5)},issue,,${holder},50\n`);
+    concord.importInstructions(asset.id, `ref,type,account,units,issued_at\nI1,freeze,${holder},,${at(5)}\n`);
+    concord.importRegister(asset.id, {
+      csv: `holder_id,account,units\nH1,${holder},50\n`,
+      asOf: at(190),
+    });
+
+    // Under 2h windows: ledger 185 is 180 minutes (3h) after ledger 5 -> outside both windows.
+    const runTight = await concord.reconcile(asset.id);
+    expect(runTight.breaks.some((b) => b.type === "UNSETTLED_ENTRY" && b.ref === "J1")).toBe(true);
+    const controlsTight = concord.controls(asset.id);
+    expect(controlsTight.breaks.some((b) => b.type === "UNEXECUTED_INSTRUCTION" && b.ref === "I1")).toBe(true);
+
+    // Widen both windows to 4h -> the 3h delay now matches cleanly.
+    const updated = await client.json<{ instructionWindowHours: number; movementWindowHours: number }>(`/api/assets/${asset.id}`, {
+      method: "PATCH",
+      body: { instructionWindowHours: 4, movementWindowHours: 4 },
+    });
+    expect(updated).toMatchObject({ instructionWindowHours: 4, movementWindowHours: 4 });
+
+    const runWide = await concord.reconcile(asset.id);
+    expect(runWide.breaks.some((b) => b.type === "UNSETTLED_ENTRY")).toBe(false);
+    const controlsWide = concord.controls(asset.id);
+    expect(controlsWide.breaks).toEqual([]);
+    expect(controlsWide.summary.instructed).toBe(1);
+
+    const pack = concord.auditExport(asset.id);
+    expect(pack.asset.instructionWindowHours).toBe(4);
+    expect(pack.asset.movementWindowHours).toBe(4);
+    expect(validateAuditPack(pack), JSON.stringify(validateAuditPack.errors)).toBe(true);
+  });
+
+  it("lists journalEntries with latest-run match status, pagination, instructionList, and CLI commands", async () => {
+    const h = harness();
+    const client = await new Client(h.app).signUp("lists@example.test", "List Books");
+    const issuer = key();
+    const holder = key();
+    const concord = h.tenants.forOrg(client.orgId);
+    const asset = await concord.watchAsset({ network: "testnet", asset: `FUND:${issuer}`, fromLedger: 1 });
+    h.chain.push(asset.id, "mint", 3, { to: holder, amount: u(100), txHash: "tx-match" });
+    await concord.sync(asset.id);
+
+    concord.importRegister(asset.id, {
+      csv: `holder_id,account,units\nH1,${holder},100\n`,
+      asOf: at(2),
+    });
+    await concord.reconcile(asset.id);
+
+    concord.importJournal(
+      asset.id,
+      `ref,date,type,from_account,to_account,units,tx_hash\nJ1,${at(3)},issue,,${holder},100,tx-match\nJ2,${at(4)},transfer,${holder},${key()},25,tx-miss\n`,
+    );
+    concord.importInstructions(
+      asset.id,
+      `ref,type,account,units,issued_at,approved_by,reason\nI1,freeze,${holder},, ${at(5)},alice,audit\n`.replace(", ", ","),
+    );
+
+    // Before movement reconciliation runs against the journal, status is null.
+    expect(concord.journalEntries("FUND")).toEqual([
+      {
+        ref: "J2",
+        date: at(4),
+        type: "transfer",
+        from: holder,
+        to: expect.any(String),
+        units: "25",
+        txHash: "tx-miss",
+        status: null,
+      },
+      {
+        ref: "J1",
+        date: at(3),
+        type: "issue",
+        from: null,
+        to: holder,
+        units: "100",
+        txHash: "tx-match",
+        status: null,
+      },
+    ]);
+
+    concord.importRegister(asset.id, {
+      csv: `holder_id,account,units\nH1,${holder},100\n`,
+      asOf: at(6),
+    });
+    await concord.reconcile(asset.id);
+
+    const listed = concord.journalEntries("FUND");
+    expect(listed.map((r) => [r.ref, r.status, r.units])).toEqual([
+      ["J2", "unmatched", "25"],
+      ["J1", "matched", "100"],
+    ]);
+    expect(concord.journalEntries("FUND", { limit: 1 })).toHaveLength(1);
+    expect(concord.journalEntries("FUND", { before: "J2" }).map((r) => r.ref)).toEqual(["J1"]);
+
+    expect(concord.instructionList("FUND")).toEqual([
+      {
+        ref: "I1",
+        type: "freeze",
+        account: holder,
+        units: null,
+        issuedAt: at(5),
+        approvedBy: "alice",
+        reason: "audit",
+      },
+    ]);
+
+    // Verify CLI commands against a disk-backed data directory.
+    const dir = mkdtempSync(join(tmpdir(), "concord-cli-543-"));
+    try {
+      const { openRuntime } = await import("../src/main.js");
+      const { loadConfig } = await import("../src/config.js");
+      const rt = openRuntime(loadConfig({ CONCORD_DATA_DIR: dir, CONCORD_SIGNUP: "open" }));
+      let orgId: string;
+      try {
+        const signed = await rt.auth.signUp({
+          email: "cli@example.test",
+          name: "CLI User",
+          orgName: "CLI Org",
+          password: "correct horse battery",
+        });
+        orgId = signed.orgId;
+        const ws = rt.tenants.forOrg(orgId);
+        // Seed an asset directly into sqlite so CLI does not touch network.
+        ws.db.insert(
+          `INSERT INTO assets (id, network, code, issuer, name, decimals, start_mode, state, created_at)
+           VALUES ('CASSETCLI', 'testnet', 'FUND', ?, 'Fund', 7, 'window', 'ready', ?)`,
+          issuer,
+          at(1),
+        );
+        ws.importJournal("FUND", `ref,date,type,from_account,to_account,units,tx_hash\nJ-CLI,${at(3)},issue,,${holder},42.5,tx-cli\n`);
+        ws.importInstructions("FUND", `ref,type,account,units,issued_at\nI-CLI,clawback,${holder},5,${at(4)}\n`);
+      } finally {
+        rt.close();
+      }
+
+      const { runCli } = await import("../src/cli.js");
+      const execCli = async (args: string[]) => {
+        const lines: string[] = [];
+        const spy = vi.spyOn(console, "log").mockImplementation((msg?: unknown) => lines.push(String(msg ?? "")));
+        try {
+          await runCli(args, { CONCORD_DATA_DIR: dir, CONCORD_ORG: orgId });
+          return lines.join("\n");
+        } finally {
+          spy.mockRestore();
+        }
+      };
+
+      const jOut = JSON.parse(await execCli(["journal-list", "FUND", "--json"])) as Array<Record<string, unknown>>;
+      expect(jOut).toEqual([
+        {
+          ref: "J-CLI",
+          date: at(3),
+          type: "issue",
+          from: null,
+          to: holder,
+          units: "42.5",
+          txHash: "tx-cli",
+          status: null,
+        },
+      ]);
+
+      const iOut = JSON.parse(await execCli(["instructions-list", "FUND", "--json"])) as Array<Record<string, unknown>>;
+      expect(iOut).toEqual([
+        {
+          ref: "I-CLI",
+          type: "clawback",
+          account: holder,
+          units: "5",
+          issuedAt: at(4),
+          approvedBy: null,
+          reason: null,
+        },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  });
+
+  it("does not let a failed deferred watch in indexing state consume maxAssetsPerOrg", async () => {
+    const h = harness({ maxAssetsPerOrg: 1 });
+    h.chain.baselineResult = undefined;
+    const client = await new Client(h.app).signUp("cap@example.test", "Quota Test");
+    const issuer = key();
+
+    const first = await client.call("/api/assets", {
+      body: { network: "testnet", asset: `BAD:${issuer}` },
+    });
+    expect(first.status).toBe(201);
+    const firstBody = (await first.json()) as { id: string; state: string };
+    expect(firstBody.state).toBe("indexing");
+
+    await vi.waitFor(async () => {
+      const detail = await client.json<{ state: string; syncError?: string }>(`/api/assets/${firstBody.id}`);
+      expect(detail.state).toBe("indexing");
+      expect(detail.syncError).toBeTruthy();
+    });
+
+    const second = await client.call("/api/assets", {
+      body: { network: "testnet", asset: `GOOD:${issuer}`, fromLedger: 1 },
+    });
+    expect(second.status).toBe(201);
+    const secondBody = (await second.json()) as { id: string };
+
+    await vi.waitFor(async () => {
+      const detail = await client.json<{ state: string }>(`/api/assets/${secondBody.id}`);
+      expect(detail.state).toBe("ready");
+    });
+
+    const third = await client.call("/api/assets", {
+      body: { network: "testnet", asset: `THIRD:${issuer}`, fromLedger: 1 },
+    });
+    expect(third.status).toBe(400);
+    expect(await third.text()).toContain("A workspace can watch 1 assets");
+  });
+
+  it("supports replace mode in importInstructions with counts, parse-issue guard, and controls update", async () => {
+    const h = harness();
+    const client = await new Client(h.app).signUp("replace@example.test", "Replace Instructions");
+    const issuer = key();
+    const h1 = key();
+    const h2 = key();
+    const h3 = key();
+    const asset = await h.tenants.forOrg(client.orgId).watchAsset({
+      network: "testnet",
+      asset: `FUND:${issuer}`,
+      fromLedger: 1,
+    });
+    h.chain.latest = 10_000;
+    const concord = h.tenants.forOrg(client.orgId);
+    await concord.sync(asset.id);
+
+    const first = concord.importInstructions(
+      asset.id,
+      `ref,type,account,units,issued_at\nI1,freeze,${h1},,${at(10)}\nI2,freeze,${h2},,${at(11)}\n`,
+    );
+    expect(first).toEqual({ instructions: 2, added: 2, replaced: 0, removed: 0, issues: [] });
+
+    const beforeControls = concord.controls(asset.id);
+    expect(beforeControls.breaks.some((b) => b.ref === "I1" && b.type === "UNEXECUTED_INSTRUCTION")).toBe(true);
+
+    const merged = concord.importInstructions(
+      asset.id,
+      `ref,type,account,units,issued_at\nI2,unfreeze,${h2},,${at(12)}\n`,
+      { mode: "merge" },
+    );
+    expect(merged).toEqual({ instructions: 1, added: 0, replaced: 1, removed: 0, issues: [] });
+
+    const replaced = concord.importInstructions(
+      asset.id,
+      `ref,type,account,units,issued_at\nI2,freeze,${h2},,${at(13)}\nI3,freeze,${h3},,${at(14)}\n`,
+      { mode: "replace" },
+    );
+    expect(replaced).toEqual({ instructions: 2, added: 1, replaced: 1, removed: 1, issues: [] });
+
+    const afterControls = concord.controls(asset.id);
+    expect(afterControls.breaks.some((b) => b.ref === "I1")).toBe(false);
+    expect(afterControls.breaks.map((b) => b.ref).sort()).toEqual(["I2", "I3"]);
+
+    // Partially parsed CSV must abort replace mode and leave I2 and I3 intact.
+    expect(() =>
+      concord.importInstructions(
+        asset.id,
+        `ref,type,account,units,issued_at\nI4,freeze,${h1},,${at(15)}\nBAD,not_a_type,${h1},,not-a-date\n`,
+        { mode: "replace" },
+      ),
+    ).toThrow(/parse issue/);
+    expect(concord.controls(asset.id).breaks.map((b) => b.ref).sort()).toEqual(["I2", "I3"]);
+
+    // HTTP POST /api/assets/:id/instructions supports { mode: "replace" }.
+    const res = await client.call(`/api/assets/${asset.id}/instructions`, {
+      body: {
+        csv: `ref,type,account,units,issued_at\nI3,freeze,${h3},,${at(14)}\n`,
+        mode: "replace",
+      },
+    });
+    expect(res.status).toBe(201);
+    expect(await res.json()).toEqual({ instructions: 1, added: 0, replaced: 1, removed: 1, issues: [] });
   });
 });
 

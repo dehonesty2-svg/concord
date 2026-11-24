@@ -19,8 +19,12 @@ Workspace commands. Name the workspace with --org <id | exact name> or CONCORD_O
   registers ASSET                  list imported registers
   register-delete ASSET ID [--yes] remove a register and its reconciliation runs
   journal ASSET FILE               import the register's transaction journal
+  journal-list ASSET [--limit N] [--before REF|ISO]  list imported journal entries
   instructions ASSET FILE          import control instructions
+  instructions-list ASSET          list imported control instructions
   reconcile ASSET [--register ID]  re-run a reconciliation
+  runs ASSET [--limit N]           list reconciliation runs for an asset
+  run ID                           show one reconciliation run
   action ASSET dividend --record ISO --rate R [--pay-asset A] [--payer G...] [--until ISO]
   action ASSET split|redemption --record ISO --ratio NUM:DEN [--until ISO]
         [--label TEXT] [--exclude A,B]
@@ -34,6 +38,7 @@ Operator commands.
   purge-expired                    remove expired identity records
   signup-code [--note TEXT]        a code that lets one new workspace be created (CONCORD_SIGNUP=code)
   reset-link EMAIL                 a one-day link for setting a new password
+  invite ORG EMAIL [--role owner|member]  create a workspace invitation link
   org-delete ORG                   delete a workspace and everything in it
   backup DIR                       copy every database to DIR while the server runs
   serve                            run the API and dashboard
