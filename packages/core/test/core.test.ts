@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildControlsLog,
   controlEvents,
+  dividendBreakdown,
   dividendEntitlements,
   formatUnits,
   mulDiv,
@@ -654,6 +655,84 @@ describe("corporate actions", () => {
     expect(r.breaks.map((b) => `${b.type}:${b.address}`)).toEqual(["SHORT:B", "UNEXPECTED:D"]);
     expect(r.lines.find((l) => l.address === "A")!.status).toBe("ok");
     expect(r.summary.difference).toBe(-172_834n);
+  });
+
+  const cashTerms = { ratePerUnit: "0.0123456789", baseDecimals: 7, payDecimals: 7, exclude: ["TREASURY"] };
+
+  it("withholds 15% after rounding the gross, and expects the net the payer sends", () => {
+    const breakdown = dividendBreakdown(snapshot, { ...cashTerms, withholdingRate: "0.15" });
+    // Gross as without withholding; withheld = floor(gross × 0.15); net = gross − withheld.
+    expect(breakdown.get("A")).toEqual({ gross: 12_345_678n, withheld: 1_851_851n, net: 10_493_827n });
+    expect(breakdown.get("B")).toEqual({ gross: 6_172_839n, withheld: 925_925n, net: 5_246_914n });
+    expect(breakdown.has("C")).toBe(false);
+    expect(breakdown.has("TREASURY")).toBe(false);
+
+    const expected = dividendEntitlements(snapshot, { ...cashTerms, withholdingRate: "0.15" });
+    expect([...expected]).toEqual([
+      ["A", 10_493_827n],
+      ["B", 5_246_914n],
+    ]);
+    const paid = [
+      ev("transfer", 10, { from: "PAYER", to: "A", amount: 10_493_827n }),
+      ev("transfer", 10, { from: "PAYER", to: "B", amount: 5_246_914n }),
+    ];
+    const observed = observeFlows(paid, { fromLedger: 6, plus: ["transfer"], minus: [], payer: "PAYER" });
+    const r = reconcileDistribution(snapshot, expected, observed);
+    expect(r.breaks).toEqual([]);
+    expect(r.summary.difference).toBe(0n);
+    // Paying the gross instead shows the withheld amount as an excess.
+    const gross = observeFlows([ev("transfer", 10, { from: "PAYER", to: "A", amount: 12_345_678n })], {
+      fromLedger: 6,
+      plus: ["transfer"],
+      minus: [],
+      payer: "PAYER",
+    });
+    expect(reconcileDistribution(snapshot, expected, gross).lines.find((l) => l.address === "A")).toMatchObject({
+      status: "EXCESS",
+      difference: 1_851_851n,
+    });
+  });
+
+  it("rounds the withheld amount with the dividend's own rounding rule", () => {
+    const breakdown = dividendBreakdown(snapshot, { ...cashTerms, withholdingRate: "0.15", rounding: "half-up" });
+    // Gross 12_345_678.9 → 12_345_679; withheld 1_851_851.85 → 1_851_852.
+    expect(breakdown.get("A")).toEqual({ gross: 12_345_679n, withheld: 1_851_852n, net: 10_493_827n });
+    // Gross 6_172_839.45 → 6_172_839; withheld 925_925.85 → 925_926.
+    expect(breakdown.get("B")).toEqual({ gross: 6_172_839n, withheld: 925_926n, net: 5_246_913n });
+  });
+
+  it("applies per-holder withholding overrides, and leaves a fully withheld holder nothing to expect", () => {
+    const terms = { ...cashTerms, withholdingRate: "0.15", withholdingOverrides: { B: "0", A: "1" } };
+    expect(dividendBreakdown(snapshot, terms).get("B")).toEqual({ gross: 6_172_839n, withheld: 0n, net: 6_172_839n });
+    expect(dividendBreakdown(snapshot, terms).get("A")).toEqual({ gross: 12_345_678n, withheld: 12_345_678n, net: 0n });
+    expect([...dividendEntitlements(snapshot, terms)]).toEqual([["B", 6_172_839n]]);
+    // A Map works as well as a plain object.
+    const asMap = { ...cashTerms, withholdingOverrides: new Map([["A", "0.3"]]) };
+    expect(dividendBreakdown(snapshot, asMap).get("A")).toEqual({
+      gross: 12_345_678n,
+      withheld: 3_703_703n,
+      net: 8_641_975n,
+    });
+  });
+
+  it("changes nothing without withholding", () => {
+    for (const [address, amounts] of dividendBreakdown(snapshot, cashTerms)) {
+      expect(amounts.withheld).toBe(0n);
+      expect(amounts.net).toBe(amounts.gross);
+      expect(dividendEntitlements(snapshot, cashTerms).get(address)).toBe(amounts.gross);
+    }
+  });
+
+  it("refuses a withholding rate outside 0 to 1", () => {
+    for (const withholdingRate of ["1.01", "-0.1", "15%", "abc"]) {
+      expect(() => dividendBreakdown(snapshot, { ...cashTerms, withholdingRate })).toThrow(
+        `withholdingRate must be a decimal from 0 to 1, got "${withholdingRate}"`,
+      );
+    }
+    expect(() => dividendBreakdown(snapshot, { ...cashTerms, withholdingOverrides: { B: "2" } })).toThrow(
+      'withholding override for B must be a decimal from 0 to 1, got "2"',
+    );
+    expect(dividendBreakdown(snapshot, { ...cashTerms, withholdingRate: "1" }).get("A")?.net).toBe(0n);
   });
 
   it("validates baseDecimals and payDecimals as integers from 0 to 38", () => {

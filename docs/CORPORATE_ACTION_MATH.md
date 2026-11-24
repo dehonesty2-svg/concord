@@ -59,6 +59,31 @@ Floor versus half-up, same rate: a holder of 15 units has an exact entitlement
 of 1_851_851.835 smallest units — `floor` yields `1_851_851`, `half-up`
 yields `1_851_852`.
 
+### Withholding
+
+With a `withholdingRate` (or a per-holder `withholdingOverrides` rate) `w`, a
+decimal from 0 to 1, `dividendBreakdown` computes, in this order:
+
+```
+gross    = entitlement above (rounded once, per holder)
+withheld = mulDiv(gross, wNum, wDen, rounding)      the same rounding rule as the gross
+net      = gross − withheld                          no further rounding
+```
+
+The withholding applies to the already rounded gross, never to the exact
+entitlement, so `gross = withheld + net` exactly and the three figures on a
+line always reconcile. `dividendEntitlements` (what the ledger is expected to
+show) is the net; a holder whose net is zero is omitted.
+
+Worked example, 15% withheld (`ratePerUnit = "0.0123456789"`, 7 decimals):
+
+| Holding | Rounding | Gross | Withheld | Net |
+|---|---|---|---|---|
+| 100 units | floor | `12_345_678` | `floor(1_851_851.7)` = `1_851_851` | `10_493_827` |
+| 50 units | floor | `6_172_839` | `floor(925_925.85)` = `925_925` | `5_246_914` |
+| 100 units | half-up | `12_345_679` | `round(1_851_851.85)` = `1_851_852` | `10_493_827` |
+| 50 units | half-up | `6_172_839` | `round(925_925.85)` = `925_926` | `5_246_913` |
+
 ## Splits
 
 For a split of `num : den` (forward when `num > den`, reverse when

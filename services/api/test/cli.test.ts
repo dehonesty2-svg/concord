@@ -3,10 +3,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { Auth } from "../src/auth.js";
 import { runCli } from "../src/cli.js";
+import { CLI_OPTIONS, closestFlag, describeArgsError } from "../src/cli-usage.js";
 import { NotFound } from "../src/concord.js";
 import { loadConfig, type Config } from "../src/config.js";
 import { openRuntime } from "../src/main.js";
@@ -14,6 +16,107 @@ import { FAST, at, key } from "./helpers.js";
 
 const tsx = fileURLToPath(import.meta.resolve("tsx/cli"));
 const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+
+/** What the CLI prints for a command line parseArgs refuses. */
+function refusal(args: string[]): string | undefined {
+  try {
+    parseArgs({ args, allowPositionals: true, options: CLI_OPTIONS });
+  } catch (err) {
+    return describeArgsError(err, args);
+  }
+  throw new Error(`parseArgs accepted ${args.join(" ")}`);
+}
+
+describe("closestFlag", () => {
+  it("suggests the flag a typo most likely meant", () => {
+    expect(closestFlag("netwrk")).toBe("network");
+    expect(closestFlag("asof")).toBe("as-of");
+    expect(closestFlag("jsno")).toBe("json");
+    expect(closestFlag("NETWORK")).toBe("network");
+    expect(closestFlag("no-basline")).toBe("no-baseline");
+  });
+
+  it("suggests the only flag that starts with what was typed", () => {
+    expect(closestFlag("dec")).toBe("decimals");
+    expect(closestFlag("pay-")).toBe("pay-asset");
+  });
+
+  it("picks the nearest of several candidates", () => {
+    expect(closestFlag("rato", ["rate", "ratio", "register"])).toBe("rate");
+    expect(closestFlag("ratioo", ["rate", "ratio", "register"])).toBe("ratio");
+  });
+
+  it("suggests nothing when no flag is close", () => {
+    expect(closestFlag("bogus")).toBeUndefined();
+    expect(closestFlag("x")).toBeUndefined();
+    expect(closestFlag("frobnicate")).toBeUndefined();
+    // Shared by more than one flag, so no prefix suggestion either.
+    expect(closestFlag("pa")).toBeUndefined();
+  });
+});
+
+describe("describeArgsError", () => {
+  const hint = "Run 'concord --help' for usage.";
+
+  it("names an unknown flag, with a suggestion when one is close", () => {
+    expect(refusal(["holdings", "X", "--bogus", "1"])).toBe(`unknown option '--bogus'. ${hint}`);
+    expect(refusal(["holdings", "X", "--asof", "2026-10-01"])).toBe(
+      `unknown option '--asof'. Did you mean '--as-of'? ${hint}`,
+    );
+    expect(refusal(["holdings", "X", "--netwrk=testnet"])).toBe(
+      `unknown option '--netwrk'. Did you mean '--network'? ${hint}`,
+    );
+    expect(refusal(["assets", "-z"])).toBe(`unknown option '-z'. ${hint}`);
+  });
+
+  it("says when a flag is missing its value or has one it does not take", () => {
+    expect(refusal(["holdings", "X", "--as-of"])).toBe(`option '--as-of' needs a value. ${hint}`);
+    expect(refusal(["holdings", "X", "--org", "--json"])).toBe(
+      `option '--org' needs a value, not '--json' (write --org=--json if that is the value). ${hint}`,
+    );
+    expect(refusal(["assets", "--json=yes"])).toBe(`option '--json' does not take a value. ${hint}`);
+  });
+
+  it("is one line and never Node's own wording", () => {
+    for (const args of [
+      ["x", "--bogus"],
+      ["x", "--org"],
+      ["x", "--org", "-y"],
+      ["x", "--yes=1"],
+    ]) {
+      const message = refusal(args)!;
+      expect(message).not.toContain("\n");
+      expect(message).not.toMatch(/To specify|ambiguous|argument missing/);
+      expect(message.endsWith(hint)).toBe(true);
+    }
+  });
+
+  it("leaves errors that are not parseArgs refusals to the caller", () => {
+    expect(describeArgsError(new Error("database is locked"), ["assets"])).toBeUndefined();
+    expect(describeArgsError(Object.assign(new Error("x"), { code: "ENOENT" }), ["assets"])).toBeUndefined();
+    expect(describeArgsError(undefined, ["assets"])).toBeUndefined();
+  });
+});
+
+describe("CLI usage errors", { timeout: 30_000 }, () => {
+  it("prints one line to stderr and exits 1 for an unknown flag", () => {
+    const res = spawnSync(process.execPath, [tsx, cliPath, "holdings", "X", "--netwrk", "testnet"], {
+      encoding: "utf8",
+    });
+    expect(res.status).toBe(1);
+    expect(res.stdout).toBe("");
+    const lines = res.stderr
+      .split(/\r?\n/)
+      .filter((line) => line && !/ExperimentalWarning|--trace-warnings/.test(line));
+    expect(lines).toEqual(["unknown option '--netwrk'. Did you mean '--network'? Run 'concord --help' for usage."]);
+  });
+
+  it("still prints the usage text for --help", () => {
+    const res = spawnSync(process.execPath, [tsx, cliPath, "--help"], { encoding: "utf8" });
+    expect(res.status).toBe(0);
+    expect(res.stdout).toContain("concord — reconcile tokenized securities");
+  });
+});
 
 describe("CLI registers and register-delete", { timeout: 30_000 }, () => {
   let dataDir: string;

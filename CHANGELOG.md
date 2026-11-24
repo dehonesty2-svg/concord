@@ -36,6 +36,9 @@ Everything to date; Concord's history begins 2026-10 with the commits below.
 
 ### Fixed
 
+- The CLI answers an unknown flag, or a flag missing its value, with one line that names the
+  flag, suggests the closest known one and points to `concord --help`, instead of Node's raw
+  parser message (#581).
 - Register imports reject as-of times more than five minutes in the future (#100).
 
 ### Added
@@ -48,6 +51,9 @@ Everything to date; Concord's history begins 2026-10 with the commits below.
 - `Concord.diffRuns(fromId, toId)` compares two reconciliation runs of one asset: each break key
   is new, resolved, persisting, or changed when its fingerprint differs, every list sorted by
   key (#567).
+- Dividend withholding (#570): `withholdingRate` and per-address `withholdingOverrides` on a
+  dividend. The expected payment is the net of withholding, applied after the gross is rounded,
+  and the action's result lines show `gross`, `withheld` and `net` (also in the audit pack).
 - CSV templates can include one illustrative example row with `?example=1` or `?example=true` (#200).
 - The accounting core (`feat(core)`, `c402eae`): holdings replay from CAP-67 events, position
   and movement reconciliation with typed breaks, corporate-action entitlements (dividend,

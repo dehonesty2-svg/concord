@@ -948,6 +948,86 @@ describe("Concord", () => {
     expect((await concord.reconcileAction(split.id)).state).toBe("clean");
   });
 
+  it("reconciles a dividend paid net of 15% withholding and shows gross, withheld and net", async () => {
+    const cash = await concord.watchAsset({ network: "testnet", asset: `USDX:${key()}`, fromLedger: 1 });
+    // Gross 0.1 per unit: h1 100 → 10, h2 50 → 5. Net of 15%: 8.5 and 4.25.
+    chain.push(cash.id, "transfer", 12, { from: treasury, to: h1, amount: 85_000_000n });
+    chain.push(cash.id, "transfer", 12, { from: treasury, to: h2, amount: 42_500_000n });
+    const action = await concord.createAction("FUND", {
+      type: "dividend",
+      recordTime: at(5),
+      ratePerUnit: "0.1",
+      payAsset: "USDX",
+      payer: treasury,
+      withholdingRate: "0.15",
+    });
+    expect(action.params).toMatchObject({ withholdingRate: "0.15" });
+    expect(action.state).toBe("clean");
+    expect(action.result!.summary).toMatchObject({ expectedTotal: "12.75", observedTotal: "12.75", breakCount: 0 });
+    const lines = new Map(action.result!.lines.map((l) => [l.address, l]));
+    expect(lines.size).toBe(2);
+    expect(lines.get(h1)).toMatchObject({ gross: "10", withheld: "1.5", net: "8.5", observed: "8.5", status: "ok" });
+    expect(lines.get(h2)).toMatchObject({ gross: "5", withheld: "0.75", net: "4.25", observed: "4.25", status: "ok" });
+    // What is expected on the ledger is the net.
+    for (const line of lines.values()) expect(line.expected).toBe(line.net);
+
+    // An exempt holder is expected to receive the gross; paying it the net is short.
+    const exempt = await concord.createAction("FUND", {
+      type: "dividend",
+      recordTime: at(5),
+      ratePerUnit: "0.1",
+      payAsset: "USDX",
+      payer: treasury,
+      withholdingRate: "0.15",
+      withholdingOverrides: { [h2]: "0" },
+    });
+    expect(exempt.result!.lines.find((l) => l.address === h2)).toMatchObject({
+      gross: "5",
+      withheld: "0",
+      net: "5",
+      observed: "4.25",
+      status: "SHORT",
+    });
+    expect(exempt.result!.breaks.map((b) => `${b.type}:${b.address}`)).toEqual([`SHORT:${h2}`]);
+
+    // The extra line fields are part of the published audit pack schema.
+    const pack = concord.auditExport("FUND");
+    expect(validateAuditPack(pack), JSON.stringify(validateAuditPack.errors, null, 2)).toBe(true);
+  });
+
+  it("keeps dividend lines as they were when no withholding is set", async () => {
+    const action = await concord.createAction("FUND", { type: "dividend", recordTime: at(5), ratePerUnit: "0.1" });
+    for (const line of action.result!.lines) {
+      expect(Object.keys(line)).toEqual([
+        "address",
+        "basis",
+        "expected",
+        "observed",
+        "difference",
+        "txHashes",
+        "status",
+      ]);
+    }
+  });
+
+  it("refuses withholding terms that are not a rate from 0 to 1 for a valid address", async () => {
+    const base = { type: "dividend" as const, recordTime: at(5), ratePerUnit: "0.1" };
+    for (const withholdingRate of ["1.5", "15", "-0.1", "0.15%", ""]) {
+      await expect(concord.createAction("FUND", { ...base, withholdingRate })).rejects.toThrow(
+        new Invalid("withholdingRate must be a decimal from 0 to 1, such as 0.15"),
+      );
+    }
+    await expect(concord.createAction("FUND", { ...base, withholdingOverrides: { [h1]: "2" } })).rejects.toThrow(
+      new Invalid(`withholdingOverrides for ${h1} must be a decimal from 0 to 1, such as 0.15`),
+    );
+    await expect(concord.createAction("FUND", { ...base, withholdingOverrides: { nobody: "0.1" } })).rejects.toThrow(
+      new Invalid("a withholdingOverrides address must be a valid Stellar address"),
+    );
+    await expect(
+      concord.createAction("FUND", { ...base, withholdingOverrides: ["0.1"] as unknown as Record<string, string> }),
+    ).rejects.toThrow(new Invalid("withholdingOverrides must map addresses to rates"));
+  });
+
   it("reports a pay asset's read-through time from its sync in the same pass", async () => {
     const cash = await concord.watchAsset({ network: "testnet", asset: `USDX:${key()}`, fromLedger: 1 });
     expect(cash.syncedAt ?? null).toBeNull();
