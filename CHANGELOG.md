@@ -54,6 +54,9 @@ Everything to date; Concord's history begins 2026-10 with the commits below.
 - Dividend withholding (#570): `withholdingRate` and per-address `withholdingOverrides` on a
   dividend. The expected payment is the net of withholding, applied after the gross is rounded,
   and the action's result lines show `gross`, `withheld` and `net` (also in the audit pack).
+- A per-asset reconciliation `tolerance` (smallest units): a holder whose chain and register
+  balances differ by no more than it is treated as matched. Schema: `ORG_MIGRATIONS` v5 adds
+  `assets.tolerance` (#564).
 - CSV templates can include one illustrative example row with `?example=1` or `?example=true` (#200).
 - The accounting core (`feat(core)`, `c402eae`): holdings replay from CAP-67 events, position
   and movement reconciliation with typed breaks, corporate-action entitlements (dividend,
