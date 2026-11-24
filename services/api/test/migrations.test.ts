@@ -43,9 +43,15 @@ describe("databases written by earlier builds", () => {
     });
   });
 
-  it("opens the v3 workspace database and reads the tolerance column", () => {
+  it("opens the v3 workspace database with the actions_due index", () => {
     upgraded("org-v3.db", ORG_MIGRATIONS, (db) => {
       expect(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'fixture'")?.value).toBe("org-v3");
+    });
+  });
+
+  it("opens the v4 workspace database and reads the tolerance column", () => {
+    upgraded("org-v4.db", ORG_MIGRATIONS, (db) => {
+      expect(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'fixture'")?.value).toBe("org-v4");
       expect(db.get<{ tolerance: string }>("SELECT tolerance FROM assets WHERE id = 'usd-mainnet'")?.tolerance).toBe("5");
     });
   });
