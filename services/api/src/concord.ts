@@ -105,6 +105,10 @@ export interface ActionInput {
   recordTime: string;
   /** End of the execution window. Open-ended when absent. */
   windowTo?: string;
+  /** First ledger of the execution window (inclusive). Events before this ledger are ignored. */
+  windowFromLedger?: number;
+  /** Last ledger of the execution window (inclusive). Events after this ledger are ignored. */
+  windowToLedger?: number;
   exclude?: string[];
   /** Dividend: pay-asset units per whole unit held. */
   ratePerUnit?: string;
@@ -174,6 +178,27 @@ const now = () => new Date().toISOString();
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 const MAX_REGISTER_CLOCK_SKEW_MS = 5 * 60_000;
 
+const HTML_ESCAPES: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+const escapeHtml = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]!);
+const SUMMARY_LABELS: Record<string, string> = {
+  chainSupply: "Chain supply",
+  registerTotal: "Register total",
+  supplyDifference: "Supply difference",
+  unmappedUnits: "Unmapped units",
+  grossDifference: "Gross difference",
+  chainHolders: "Chain holders",
+  registerHolders: "Register holders",
+  lines: "Lines",
+  matchedLines: "Matched lines",
+  breakCount: "Breaks",
+};
+
 function isoTime(input: string, field: string): string {
   const t = Date.parse(input);
   if (Number.isNaN(t)) throw new Invalid(`${field} is not a valid date: "${input}"`);
@@ -216,11 +241,47 @@ function label(value: unknown, field: string, max = 120): string | undefined {
   return value.trim() || undefined;
 }
 
+function isDbLockedError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as Record<string, unknown>;
+  if (typeof e.errcode === "number") {
+    const primary = e.errcode & 0xff;
+    if (primary === 5 || primary === 6) return true;
+  }
+  if (e.code === "SQLITE_BUSY" || e.code === "SQLITE_LOCKED") return true;
+  const msg = typeof e.message === "string" ? e.message : "";
+  const errstr = typeof e.errstr === "string" ? e.errstr : "";
+  return (
+    /sqlite_busy|sqlite_locked/i.test(msg) ||
+    /database is locked|database table is locked/i.test(msg) ||
+    /database is locked|busy/i.test(errstr)
+  );
+}
+
+function isDiskFullError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as Record<string, unknown>;
+  if (typeof e.errcode === "number") {
+    const primary = e.errcode & 0xff;
+    if (primary === 13) return true;
+  }
+  if (e.code === "SQLITE_FULL" || e.code === "ENOSPC") return true;
+  const msg = typeof e.message === "string" ? e.message : "";
+  const errstr = typeof e.errstr === "string" ? e.errstr : "";
+  return (
+    /sqlite_full|enospc/i.test(msg) ||
+    /database or disk is full|disk full|no space left/i.test(msg) ||
+    /database or disk is full/i.test(errstr)
+  );
+}
+
 /** What to tell the dashboard about a failed pass. Internals stay in the server log. */
-function describeFailure(err: unknown): string {
+export function describeFailure(err: unknown): string {
   if (err instanceof ChainError || err instanceof Invalid || err instanceof NotFound) return err.message;
   console.error(err);
-  return "Indexing stopped on an unexpected error.";
+  if (isDbLockedError(err)) return "[db_locked] Database is locked.";
+  if (isDiskFullError(err)) return "[disk_full] Database or disk is full.";
+  return "[internal] Indexing stopped on an unexpected error.";
 }
 
 function toAsset(row: Row): AssetRecord {
@@ -270,6 +331,7 @@ function toEvent(row: Row): AssetEvent {
  */
 export class Concord {
   private readonly syncing = new Map<string, Promise<{ added: number }>>();
+  private readonly removing = new Set<string>();
   /** Current holdings per asset; replaying every event on each dashboard poll is too slow. */
   private readonly stateMemo = new Map<string, HoldingsState>();
   private seenVersion: number;
@@ -353,7 +415,7 @@ export class Concord {
     } catch (err) {
       throw new Invalid((err as Error).message);
     }
-    if (this.db.get("SELECT id FROM assets WHERE id = ?", resolved.id)) {
+    if (this.removing.has(resolved.id) || this.db.get("SELECT id FROM assets WHERE id = ?", resolved.id)) {
       throw new Invalid(`${resolved.code} is already watched`);
     }
     const ignore = addresses(input.ignore, "ignore");
@@ -395,7 +457,7 @@ export class Concord {
 
     // The check above ran before the awaits on the chain; another request may have watched the
     // same asset since. Nothing awaits between this check and the insert.
-    if (this.db.get("SELECT id FROM assets WHERE id = ?", resolved.id)) {
+    if (this.removing.has(resolved.id) || this.db.get("SELECT id FROM assets WHERE id = ?", resolved.id)) {
       throw new Invalid(`${resolved.code} is already watched`);
     }
     try {
@@ -509,10 +571,15 @@ export class Concord {
   /** Stop watching: the asset, its events and every book uploaded against it are deleted. */
   async unwatchAsset(ref: string): Promise<void> {
     const asset = this.asset(ref);
-    // A pass still running would write its events into an asset watched again under the same id.
-    await this.syncing.get(asset.id)?.catch(() => {});
-    this.db.write("DELETE FROM assets WHERE id = ?", asset.id);
-    this.touch(asset.id);
+    this.removing.add(asset.id);
+    try {
+      // A pass still running would write its events into an asset watched again under the same id.
+      await this.syncing.get(asset.id)?.catch(() => {});
+      this.db.write("DELETE FROM assets WHERE id = ?", asset.id);
+      this.touch(asset.id);
+    } finally {
+      this.removing.delete(asset.id);
+    }
   }
 
   /**
@@ -522,7 +589,9 @@ export class Concord {
    */
   async rebuild(ref: string, options: { defer?: boolean } = {}): Promise<AssetRecord> {
     const asset = this.asset(ref);
+    if (this.removing.has(asset.id)) throw new NotFound(`asset ${ref} is not watched`);
     await this.syncing.get(asset.id)?.catch(() => {});
+    if (this.removing.has(asset.id)) throw new NotFound(`asset ${ref} is not watched`);
     this.db.tx(() => {
       this.db.write("DELETE FROM events WHERE asset_id = ?", asset.id);
       this.db.write("DELETE FROM openings WHERE asset_id = ?", asset.id);
@@ -545,6 +614,7 @@ export class Concord {
   /** Pull new events for one asset. Concurrent calls share one pass. */
   sync(ref: string, head?: ChainHead): Promise<{ added: number }> {
     const asset = this.asset(ref);
+    if (this.removing.has(asset.id)) throw new NotFound(`asset ${ref} is not watched`);
     const running = this.syncing.get(asset.id);
     if (running) return running;
     const pass = this.runSync(asset, head).finally(() => this.syncing.delete(asset.id));
@@ -604,11 +674,13 @@ export class Concord {
         }
       }
       const out = await this.syncPass(ready, chain);
+      if (this.removing.has(asset.id)) return { added: 0 };
       if (asset.syncError) {
         this.db.write("UPDATE assets SET sync_error = NULL, sync_error_at = NULL WHERE id = ?", asset.id);
       }
       return out;
     } catch (err) {
+      if (this.removing.has(asset.id)) throw err;
       this.db.write(
         "UPDATE assets SET sync_error = ?, sync_error_at = ? WHERE id = ?",
         describeFailure(err),
@@ -627,7 +699,9 @@ export class Concord {
       : { startLedger: asset.startLedger };
     let added = 0;
     for (let i = 0; i < 10_000; i++) {
+      if (this.removing.has(asset.id)) break;
       const page = await chain.getEvents(asset.id, from, limit);
+      if (this.removing.has(asset.id)) break;
       const cursor = page.cursor ?? page.events.at(-1)?.id;
       const previous = "cursor" in from ? from.cursor : undefined;
       // Caught up when the cursor stops moving, or a short page ends at the chain's tip.
@@ -874,10 +948,17 @@ export class Concord {
   }
 
   /** Remove a register, its holder lines and every reconciliation run against it. */
-  deleteRegister(ref: string, registerId: number): void {
+  deleteRegister(ref: string, registerId: number): { runs: number } {
     const asset = this.asset(ref);
+    const runs =
+      this.db.get<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM runs WHERE register_id = ? AND asset_id = ?",
+        registerId,
+        asset.id,
+      )?.count ?? 0;
     const removed = this.db.write("DELETE FROM registers WHERE id = ? AND asset_id = ?", registerId, asset.id);
     if (removed === 0) throw new NotFound("no such register for this asset");
+    return { runs };
   }
 
   private registerPositions(registerId: number): RegisterPosition[] {
@@ -890,7 +971,16 @@ export class Concord {
     });
   }
 
-  importJournal(ref: string, csv: string) {
+  importJournal(
+    ref: string,
+    csv: string,
+    options?: { mode?: "merge" | "replace"; allowPartial?: boolean },
+  ) {
+    const mode = options?.mode ?? "merge";
+    const allowPartial = options?.allowPartial ?? false;
+    if (mode !== "merge" && mode !== "replace") {
+      throw new Invalid("mode must be 'merge' or 'replace'");
+    }
     const asset = this.asset(ref);
     let parsed;
     try {
@@ -898,23 +988,82 @@ export class Concord {
     } catch (err) {
       throw new Invalid((err as Error).message);
     }
+    if (mode === "replace" && parsed.issues.length > 0 && !allowPartial) {
+      throw new Invalid(`cannot replace journal: CSV contains ${parsed.issues.length} parse errors and allowPartial is false`);
+    }
+
+    const existing = this.db.all<{ ref: string }>("SELECT ref FROM journal WHERE asset_id = ?", asset.id);
+    const existingRefs = new Set(existing.map((r) => r.ref));
+
+    let added = 0;
+    let replaced = 0;
+    let removed = 0;
+
     this.db.tx(() => {
-      for (const e of parsed.entries) {
-        this.db.insert(
-          `INSERT OR REPLACE INTO journal (asset_id, ref, date, type, from_addr, to_addr, units, tx_hash)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          asset.id,
-          e.ref,
-          e.date,
-          e.type,
-          e.from ?? null,
-          e.to ?? null,
-          e.units.toString(),
-          e.txHash ?? null,
-        );
+      if (mode === "replace") {
+        const fileRefs = new Set(parsed.entries.map((e) => e.ref));
+        for (const r of existingRefs) {
+          if (!fileRefs.has(r)) {
+            removed++;
+          }
+        }
+        this.db.write("DELETE FROM journal WHERE asset_id = ?", asset.id);
+        const seenInFile = new Set<string>();
+        for (const e of parsed.entries) {
+          if (!seenInFile.has(e.ref)) {
+            seenInFile.add(e.ref);
+            if (existingRefs.has(e.ref)) {
+              replaced++;
+            } else {
+              added++;
+            }
+          }
+          this.db.insert(
+            `INSERT OR REPLACE INTO journal (asset_id, ref, date, type, from_addr, to_addr, units, tx_hash)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            asset.id,
+            e.ref,
+            e.date,
+            e.type,
+            e.from ?? null,
+            e.to ?? null,
+            e.units.toString(),
+            e.txHash ?? null,
+          );
+        }
+      } else {
+        const seenInFile = new Set<string>();
+        for (const e of parsed.entries) {
+          if (!seenInFile.has(e.ref)) {
+            seenInFile.add(e.ref);
+            if (existingRefs.has(e.ref)) {
+              replaced++;
+            } else {
+              added++;
+            }
+          }
+          this.db.insert(
+            `INSERT OR REPLACE INTO journal (asset_id, ref, date, type, from_addr, to_addr, units, tx_hash)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            asset.id,
+            e.ref,
+            e.date,
+            e.type,
+            e.from ?? null,
+            e.to ?? null,
+            e.units.toString(),
+            e.txHash ?? null,
+          );
+        }
       }
     });
-    return { entries: parsed.entries.length, issues: parsed.issues };
+    return {
+      entries: parsed.entries.length,
+      issues: parsed.issues,
+      added,
+      replaced,
+      removed,
+    };
   }
 
   private journal(assetId: string): JournalEntry[] {
@@ -1137,6 +1286,171 @@ export class Concord {
     };
   }
 
+  runReport(id: number) {
+    const row = this.db.get("SELECT * FROM runs WHERE id = ?", id);
+    if (!row) throw new NotFound(`reconciliation ${id} not found`);
+    const stored = String(row.result);
+    const result = JSON.parse(stored) as RunResult;
+    const asset = this.asset(String(row.asset_id));
+    const breaks = this.annotate(asset.id, "recon", result.breaks);
+    const digest = sha256(stored);
+    const historyStart = this.historyStart(asset);
+    const value = (raw: unknown) => (raw === null || raw === undefined || raw === "" ? "n/a" : escapeHtml(raw));
+    const facts = (entries: Array<[string, unknown]>) =>
+      entries
+        .map(([label, raw]) => `<tr><th scope="row">${escapeHtml(label)}</th><td>${value(raw)}</td></tr>`)
+        .join("\n            ");
+    const summary = facts([
+      ["Status", result.status],
+      ...Object.entries(result.summary).map(([key, raw]): [string, unknown] => [SUMMARY_LABELS[key] ?? key, raw]),
+    ]);
+    const coverage = facts([
+      ["History starts", historyStart ?? null],
+      ["Start mode", asset.startMode],
+      ["Start ledger", asset.startLedger ?? null],
+      ["Baseline ledger", asset.baselineLedger ?? null],
+      ["Indexed to ledger", asset.syncedLedger ?? null],
+      ["Indexed to time", asset.syncedAt ?? null],
+      ["Chain ledger at run", result.chainLedger],
+      ["Chain synced at run", result.chainSyncedAt],
+      ["Chain behind register", result.chainBehind ? "yes" : "no"],
+      ["Ignored addresses", asset.ignore.length === 0 ? "none" : asset.ignore.join(", ")],
+    ]);
+    const warnings =
+      result.warnings.length === 0
+        ? `<p class="empty">No warnings.</p>`
+        : `<ul>\n            ${result.warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join("\n            ")}\n          </ul>`;
+    const breakSections =
+      breaks.length === 0
+        ? `<p class="empty">No breaks in this run.</p>`
+        : breaks
+            .map((b) => {
+              const history = this.noteHistory(asset.id, "recon", b.key);
+              const historyRows =
+                history.length === 0
+                  ? `<tr><td colspan="4">No sign-off history.</td></tr>`
+                  : history
+                      .map(
+                        (h) =>
+                          `<tr><td>${value(h.at)}</td><td>${value(h.status)}</td><td>${value(h.author)}</td><td>${value(h.note)}</td></tr>`,
+                      )
+                      .join("\n                  ");
+              const factsRows = facts([
+                ["Scope", b.scope],
+                ["Key", b.key],
+                ["Address", b.address],
+                ["Holder IDs", b.holderIds?.join(", ") ?? null],
+                ["Chain units", b.chainUnits],
+                ["Register units", b.registerUnits],
+                ["Difference", b.difference],
+                ["Expected", b.expected],
+                ["Observed", b.observed],
+                ["Transaction", b.txHash],
+                ["Event", b.eventId],
+                ["First seen", b.firstSeen],
+                ["Current status", b.status],
+                ["Current note", b.note],
+                ["Noted by", b.noteAuthor],
+                ["Noted at", b.noteAt],
+                ["Stale note", b.noteStale ? "yes" : "no"],
+              ]);
+              return `<article class="break">
+          <h3>${escapeHtml(b.type)} <span class="severity severity-${escapeHtml(b.severity)}">${escapeHtml(b.severity)}</span></h3>
+          <p>${escapeHtml(b.message)}</p>
+          <table class="facts">
+            ${factsRows}
+          </table>
+          <h4>Sign-off history</h4>
+          <table>
+            <thead><tr><th>When</th><th>Status</th><th>By</th><th>Note</th></tr></thead>
+            <tbody>
+                  ${historyRows}
+            </tbody>
+          </table>
+        </article>`;
+            })
+            .join("\n        ");
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Concord reconciliation report ${escapeHtml(asset.code)} ${escapeHtml(result.asOf)}</title>
+<style>
+:root { color-scheme: light; }
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; background: #f6f7f9; color: #16181d; font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; }
+main { max-width: 980px; margin: 0 auto; padding: 32px 24px 64px; background: #fff; }
+header { border-bottom: 2px solid #16181d; padding-bottom: 16px; margin-bottom: 24px; }
+.eyebrow { margin: 0 0 4px; text-transform: uppercase; letter-spacing: 0.08em; font-size: 11px; color: #5b6070; }
+h1 { margin: 0 0 8px; font-size: 26px; line-height: 1.2; }
+h2 { font-size: 18px; margin: 32px 0 12px; padding-bottom: 6px; border-bottom: 1px solid #d8dbe2; }
+h3 { font-size: 15px; margin: 0 0 6px; }
+h4 { font-size: 13px; margin: 16px 0 6px; text-transform: uppercase; letter-spacing: 0.04em; color: #5b6070; }
+.meta, .empty { color: #5b6070; }
+section { margin-bottom: 28px; }
+table { width: 100%; border-collapse: collapse; margin: 8px 0 0; }
+th, td { text-align: left; vertical-align: top; padding: 6px 8px; border-bottom: 1px solid #e3e5ea; }
+th { font-weight: 600; color: #3b3f4a; }
+table.facts th { width: 34%; }
+.break { border: 1px solid #d8dbe2; border-radius: 6px; padding: 12px 14px; margin: 12px 0; page-break-inside: avoid; break-inside: avoid; }
+.severity { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; background: #eef0f4; color: #3b3f4a; }
+.severity-high { background: #fde8e6; color: #9f1d14; }
+.severity-medium { background: #fff2d9; color: #8a5a00; }
+.severity-low { background: #e7f0fb; color: #1f4e8c; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; }
+ul { margin: 6px 0 0; padding-left: 20px; }
+@media print {
+  body { background: #fff; font-size: 11pt; }
+  main { max-width: none; padding: 0; }
+  h2 { page-break-after: avoid; break-after: avoid; }
+  .break { page-break-inside: avoid; break-inside: avoid; }
+  @page { margin: 16mm; }
+}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">Concord reconciliation report</p>
+    <h1>${escapeHtml(asset.name)} (${escapeHtml(asset.code)})</h1>
+    <p class="meta">Run ${escapeHtml(row.id)} | ${escapeHtml(asset.network)} | created ${value(row.created_at)} | as of ${value(result.asOf)}</p>
+  </header>
+
+  <section>
+    <h2>Integrity</h2>
+    <table class="facts">
+      <tr><th scope="row">Run result SHA-256</th><td><code>${escapeHtml(digest)}</code></td></tr>
+      <tr><th scope="row">Register SHA-256</th><td><code>${escapeHtml(result.registerSha256)}</code></td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>Summary</h2>
+    <table class="facts">
+      ${summary}
+    </table>
+  </section>
+
+  <section>
+    <h2>Coverage</h2>
+    <table class="facts">
+      ${coverage}
+    </table>
+    <h3>Warnings</h3>
+    ${warnings}
+  </section>
+
+  <section>
+    <h2>Breaks</h2>
+    ${breakSections}
+  </section>
+</main>
+</body>
+</html>
+`;
+  }
+
   runs(ref: string) {
     const asset = this.asset(ref);
     return this.db
@@ -1285,6 +1599,18 @@ export class Concord {
     const recordTime = isoTime(String(input.recordTime ?? ""), "recordTime");
     const params: Record<string, unknown> = { exclude: addresses(input.exclude, "exclude") };
     if (input.windowTo) params.windowTo = isoTime(input.windowTo, "windowTo");
+    if (input.windowFromLedger !== undefined) {
+      if (!Number.isInteger(input.windowFromLedger) || input.windowFromLedger < 1) {
+        throw new Invalid("windowFromLedger must be a positive ledger sequence number");
+      }
+      params.windowFromLedger = input.windowFromLedger;
+    }
+    if (input.windowToLedger !== undefined) {
+      if (!Number.isInteger(input.windowToLedger) || input.windowToLedger < 1) {
+        throw new Invalid("windowToLedger must be a positive ledger sequence number");
+      }
+      params.windowToLedger = input.windowToLedger;
+    }
     if (input.type === "dividend") {
       if (!input.ratePerUnit || !/^\d+(\.\d+)?$/.test(input.ratePerUnit)) {
         throw new Invalid("dividend needs ratePerUnit as a decimal");
@@ -1433,11 +1759,15 @@ export class Concord {
       }
     }
     const windowTo = params.windowTo as string | undefined;
+    const windowFromLedger = params.windowFromLedger as number | undefined;
+    const windowToLedger = params.windowToLedger as number | undefined;
     const observed = observeFlows(this.loadEvents(flowAsset.id), {
       afterTime: recordTime,
       plus,
       minus,
       ...(windowTo ? { untilTime: windowTo } : {}),
+      ...(windowFromLedger !== undefined ? { fromLedger: windowFromLedger } : {}),
+      ...(windowToLedger !== undefined ? { toLedger: windowToLedger } : {}),
       ...(payer ? { payer } : {}),
     });
     if (payer && observed.size === 0) {
@@ -1717,6 +2047,10 @@ export class Concord {
       .all<{ id: number }>("SELECT id FROM runs WHERE asset_id = ? ORDER BY as_of, id", asset.id)
       .map(({ id }) => this.run(id))
       .filter((r) => inPeriod(r.asOf));
+    const runRegisterIds = new Set(runs.map((r) => r.registerId));
+    const registers = this.registers(asset.id)
+      .filter((r) => inPeriod(r.asOf) || runRegisterIds.has(r.id))
+      .sort((a, b) => a.asOf.localeCompare(b.asOf) || a.id - b.id);
     const content = {
       asset: {
         id: asset.id,
@@ -1737,6 +2071,7 @@ export class Concord {
         const { beforeHistory: _beforeHistory, warnings: _warnings, ...rest } = this.holdings(asset.id, to);
         return rest;
       })(),
+      registers,
       reconciliations: runs,
       corporateActions: this.actions(asset.id).filter((a) => inPeriod(a.recordTime)),
       controls,
